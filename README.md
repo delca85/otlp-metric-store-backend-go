@@ -37,6 +37,8 @@ metadata           otel_metrics_sum
 
 Metric identity (name, service, attributes) is extracted once into `otel_metrics_metadata` (`AggregatingMergeTree`), which merges duplicate rows per sort key on compaction, applying `anyLast` semantics to mutable fields. Datapoint tables (`MergeTree`) store only the numeric value, timestamps, and a `MetricHash` — a deterministic `UInt64` xxHash64 of the identity fields computed in Go at ingest time.
 
+The metadata table's `TimeUnix` column is a `Date` (day granularity), not `DateTime64`. This is intentional: the `AggregatingMergeTree` dedup unit is one metadata row per series per day, matching the `ORDER BY (TimeUnix, MetricName, MetricHash)` key. Datapoint tables use `DateTime64(9)` for full nanosecond precision.
+
 This eliminates per-datapoint attribute storage while keeping JOINs fast: metadata cardinality is expected to be low and the table fits in memory for broadcast joins.
 
 **Hashing key:** `MetricName \x00 ServiceName \x00 sorted(ResourceAttributes) \x00 sorted(ScopeAttributes) \x00 sorted(Attributes)`
@@ -47,7 +49,7 @@ Fields are separated by `\x00`, map entries by `\x01`, and key-value pairs by `\
 
 | Table | Engine | Partition | Purpose |
 |---|---|---|---|
-| `otel_metrics_metadata` | AggregatingMergeTree | monthly (`toYYYYMM(TimeUnix)`) | Metric identity + attributes lookup |
+| `otel_metrics_metadata` | AggregatingMergeTree | monthly (`toYYYYMM(TimeUnix)`) · `ORDER BY (TimeUnix, MetricName, MetricHash)` | Metric identity + attributes lookup |
 | `otel_metrics_gauge` | MergeTree | daily (`toDate(TimeUnix)`) | Gauge datapoints |
 | `otel_metrics_sum` | MergeTree | daily | Sum datapoints |
 | `otel_metrics_histogram` | MergeTree | daily | Histogram datapoints (schema only) |
@@ -69,6 +71,8 @@ Both engines deduplicate rows on compaction. `ReplacingMergeTree` keeps the late
 
 **Partition + ordering strategy eliminates full scans**
 All queries are guaranteed to include a time-frame filter. Partitioning by time (monthly for metadata, daily for datapoints) combined with a time-leading `ORDER BY` key ensures ClickHouse prunes irrelevant parts before scanning a single row.
+
+The metadata table uses `ORDER BY (TimeUnix, MetricName, MetricHash)` — `MetricName` sits between the time key and the hash so that queries filtering by name after a time range can use the primary index. Datapoint tables use `ORDER BY (toUnixTimestamp64Nano(TimeUnix), MetricHash)` — the explicit `Int64` cast avoids any ambiguity in how ClickHouse sorts `DateTime64(9)` values.
 
 **Server-side async inserts for high throughput**
 `async_insert=1` with `wait_for_async_insert=1` lets ClickHouse buffer and merge small per-RPC inserts server-side without application-level batching logic, while still propagating errors back to the caller.
@@ -261,7 +265,7 @@ The service instruments itself using the OpenTelemetry Go SDK and exports to **s
 | Signal | What is recorded |
 |---|---|
 | **Traces** | One span per `Export()` call; child spans per batch insert — includes table name, batch size, error status |
-| **Metrics** | `com.dash0.homeexercise.metrics.received` (counter), `metric_store.inserts_total` (counter, `{table, status}` labels), `metric_store.insert_duration_ms` (histogram) |
+| **Metrics** | `com.dash0.homeexercise.metrics.received` (counter — increments once per `Export()` RPC call, not per datapoint), `metric_store.inserts_total` (counter, `{table, status}` labels), `metric_store.insert_duration_ms` (histogram) |
 | **Logs** | Structured logs via `log/slog` |
 
 ---
