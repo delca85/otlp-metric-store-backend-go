@@ -548,6 +548,243 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 	}
 }
 
+// TestGRPCMixedBatch sends a single Export request containing both a Gauge and a Sum metric,
+// exercising the errgroup concurrent insert path in metrics_service.go. Both datapoints and
+// their metadata must land in their respective tables after a single RPC call.
+func TestGRPCMixedBatch(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer("bufconn", store))
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Printf("error serving server: %v", err)
+		}
+	}()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("connecting to grpc server: %v", err)
+	}
+	defer conn.Close()
+
+	client := colmetricspb.NewMetricsServiceClient(conn)
+
+	now := uint64(time.Now().UnixNano())
+
+	// A single ResourceMetrics payload containing one Gauge and one Sum under the same resource.
+	mixedResourceMetrics := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "mixed-service"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "mixed-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "mixed.cpu.usage",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 55.0}},
+									},
+								},
+							},
+						},
+						{
+							Name: "mixed.requests.total",
+							Data: &metricspb.Metric_Sum{
+								Sum: &metricspb.Sum{
+									AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+									IsMonotonic:            true,
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 100.0}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Pre-compute hashes so we can query deterministically after the RPC.
+	expectedGaugeRows, _ := MapGaugeRows(mixedResourceMetrics)
+	expectedSumRows, _ := MapSumRows(mixedResourceMetrics)
+	if len(expectedGaugeRows) == 0 || len(expectedSumRows) == 0 {
+		t.Fatal("expected at least one gauge and one sum row from mappers")
+	}
+	gaugeHash := expectedGaugeRows[0].MetricHash
+	sumHash := expectedSumRows[0].GaugeRow.MetricHash
+
+	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: mixedResourceMetrics,
+	})
+	if err != nil {
+		t.Fatalf("exporting mixed batch via grpc: %v", err)
+	}
+
+	// Gauge datapoint must be in otel_metrics_gauge.
+	var gaugeValue float64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT Value FROM otel_metrics_gauge WHERE MetricHash = $1",
+		gaugeHash,
+	).Scan(&gaugeValue); err != nil {
+		t.Fatalf("querying otel_metrics_gauge: %v", err)
+	}
+	if gaugeValue != 55.0 {
+		t.Errorf("expected gauge Value=55.0, got %f", gaugeValue)
+	}
+
+	// Sum datapoint must be in otel_metrics_sum.
+	var sumValue float64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT Value FROM otel_metrics_sum WHERE MetricHash = $1",
+		sumHash,
+	).Scan(&sumValue); err != nil {
+		t.Fatalf("querying otel_metrics_sum: %v", err)
+	}
+	if sumValue != 100.0 {
+		t.Errorf("expected sum Value=100.0, got %f", sumValue)
+	}
+
+	// Both metadata entries must be resolvable from their respective hashes.
+	var gaugeName, sumName string
+	if err := store.conn.QueryRow(ctx,
+		"SELECT MetricName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		gaugeHash,
+	).Scan(&gaugeName); err != nil {
+		t.Fatalf("querying metadata for gauge hash: %v", err)
+	}
+	if gaugeName != "mixed.cpu.usage" {
+		t.Errorf("expected MetricName=mixed.cpu.usage, got %s", gaugeName)
+	}
+
+	if err := store.conn.QueryRow(ctx,
+		"SELECT MetricName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		sumHash,
+	).Scan(&sumName); err != nil {
+		t.Fatalf("querying metadata for sum hash: %v", err)
+	}
+	if sumName != "mixed.requests.total" {
+		t.Errorf("expected MetricName=mixed.requests.total, got %s", sumName)
+	}
+}
+
+// TestResourceAttributeEvolution verifies that when the same metric name is reported from two
+// resources with different attributes (e.g. two hosts), each produces a distinct MetricHash and
+// a separate metadata row. This validates the assignment requirement: "Resources (Attributes)
+// are likely to change over time" — a new resource identity must never overwrite an existing one.
+func TestResourceAttributeEvolution(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	makeRM := func(hostname string) []*metricspb.ResourceMetrics {
+		now := uint64(time.Now().UnixNano())
+		return []*metricspb.ResourceMetrics{
+			{
+				Resource: &resourcepb.Resource{
+					Attributes: []*commonpb.KeyValue{
+						{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "evo-service"}}},
+						{Key: "host.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: hostname}}},
+					},
+				},
+				ScopeMetrics: []*metricspb.ScopeMetrics{
+					{
+						Scope: &commonpb.InstrumentationScope{Name: "evo-scope"},
+						Metrics: []*metricspb.Metric{
+							{
+								Name: "evo.cpu.usage",
+								Data: &metricspb.Metric_Gauge{
+									Gauge: &metricspb.Gauge{
+										DataPoints: []*metricspb.NumberDataPoint{
+											{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	rm1 := makeRM("host-1")
+	rm2 := makeRM("host-2")
+
+	rows1, metadata1 := MapGaugeRows(rm1)
+	rows2, metadata2 := MapGaugeRows(rm2)
+
+	hash1 := rows1[0].MetricHash
+	hash2 := rows2[0].MetricHash
+	if hash1 == hash2 {
+		t.Fatalf("expected different MetricHash for different resource attributes, got same hash %d", hash1)
+	}
+
+	if err := store.InsertGauge(ctx, rows1, metadata1); err != nil {
+		t.Fatalf("inserting host-1 gauge: %v", err)
+	}
+	if err := store.InsertGauge(ctx, rows2, metadata2); err != nil {
+		t.Fatalf("inserting host-2 gauge: %v", err)
+	}
+
+	// Each host must have its own metadata row — two distinct series in otel_metrics_metadata.
+	var count uint64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT count() FROM otel_metrics_metadata FINAL WHERE MetricName = 'evo.cpu.usage'",
+	).Scan(&count); err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 metadata rows for 2 distinct resource attribute sets, got %d", count)
+	}
+
+	// Verify each hash resolves to the correct host's resource attributes.
+	var resAttrs1, resAttrs2 map[string]string
+	if err := store.conn.QueryRow(ctx,
+		"SELECT ResourceAttributes FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		hash1,
+	).Scan(&resAttrs1); err != nil {
+		t.Fatalf("querying metadata for host-1 hash: %v", err)
+	}
+	if resAttrs1["host.name"] != "host-1" {
+		t.Errorf("expected host.name=host-1 in ResourceAttributes, got %v", resAttrs1)
+	}
+
+	if err := store.conn.QueryRow(ctx,
+		"SELECT ResourceAttributes FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		hash2,
+	).Scan(&resAttrs2); err != nil {
+		t.Fatalf("querying metadata for host-2 hash: %v", err)
+	}
+	if resAttrs2["host.name"] != "host-2" {
+		t.Errorf("expected host.name=host-2 in ResourceAttributes, got %v", resAttrs2)
+	}
+}
+
 func TestGRPCToClickHouse(t *testing.T) {
 	store, cleanup := setupClickHouse(t)
 	defer cleanup()
