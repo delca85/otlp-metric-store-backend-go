@@ -17,7 +17,9 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/grpc"
+	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -698,10 +700,9 @@ func TestGRPC_MissingServiceName_InsertsWithEmptyServiceName(t *testing.T) {
 	}
 }
 
-// TestGRPC_EmptyMetricName_InsertsWithEmptyName verifies that a metric with an empty name string
-// is accepted and stored as-is. The hash is computed with MetricName="" — it is stable and
-// non-zero — so the row is inserted and queryable via its hash.
-func TestGRPC_EmptyMetricName_InsertsWithEmptyName(t *testing.T) {
+// TestGRPC_EmptyMetricName_RejectsWithInvalidArgument verifies that a metric with an empty name
+// is rejected with an InvalidArgument gRPC error, as required by the OTLP spec.
+func TestGRPC_EmptyMetricName_RejectsWithInvalidArgument(t *testing.T) {
 	store, cleanup := setupClickHouse(t)
 	defer cleanup()
 
@@ -726,7 +727,7 @@ func TestGRPC_EmptyMetricName_InsertsWithEmptyName(t *testing.T) {
 					Scope: &commonpb.InstrumentationScope{Name: "empty-name-scope"},
 					Metrics: []*metricspb.Metric{
 						{
-							Name: "", // intentionally empty
+							Name: "", // intentionally empty — must be rejected
 							Data: &metricspb.Metric_Gauge{
 								Gauge: &metricspb.Gauge{
 									DataPoints: []*metricspb.NumberDataPoint{
@@ -742,24 +743,11 @@ func TestGRPC_EmptyMetricName_InsertsWithEmptyName(t *testing.T) {
 	}
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
-	if err != nil {
-		t.Fatalf("Export with empty metric name returned unexpected error: %v", err)
+	if err == nil {
+		t.Fatal("expected Export with empty metric name to return an error, got nil")
 	}
-
-	expectedRows, _ := MapGaugeRows(rm)
-	if len(expectedRows) == 0 {
-		t.Fatal("expected mapper to produce a gauge row despite empty metric name")
-	}
-	hash := expectedRows[0].MetricHash
-
-	var metricName string
-	if err := store.conn.QueryRow(ctx,
-		"SELECT MetricName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1", hash,
-	).Scan(&metricName); err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if metricName != "" {
-		t.Errorf("expected MetricName=\"\" to be stored as-is, got %q", metricName)
+	if code := status.Code(err); code != grpccodes.InvalidArgument {
+		t.Errorf("expected gRPC status InvalidArgument, got %v", code)
 	}
 }
 

@@ -284,6 +284,14 @@ make clean   # go clean
 
 ## Known Limitations
 
+### `DATA_POINT_FLAGS_NO_RECORDED_VALUE` not preserved
+
+The OTLP spec defines flag bit `1` (`DATA_POINT_FLAGS_NO_RECORDED_VALUE_MASK`) to signal that a measurement was attempted but no value was recorded (e.g. a scrape failure or counter reset). When this flag is set, the value field must be ignored.
+
+Currently the flag is stored as-is in the `Flags` column but the `Value` field is stored as a regular float, which is indistinguishable from a real zero measurement. The standard behaviour — used by the OTel Collector and backends like the official ClickHouse exporter — is to store `NULL` for the value, preserving the gap in the time series for downstream tools (Grafana, Prometheus) that distinguish "value was zero" from "measurement was absent."
+
+Fixing this requires changing `Value Float64` → `Value Nullable(Float64)` in `otel_metrics_gauge` and `otel_metrics_sum`, updating the mapper to emit `nil` when the flag is set, and adjusting the ClickHouse insert logic accordingly.
+
 ### Unimplemented metric types
 
 Insert logic is currently implemented only for **Gauge** and **Sum** metrics. The following types have table schemas defined but are **not yet handled** — datapoints of these types are silently dropped at ingest:

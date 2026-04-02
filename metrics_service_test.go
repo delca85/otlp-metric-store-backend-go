@@ -232,6 +232,188 @@ func TestExport_InsertSumError_ReturnsError(t *testing.T) {
 	}
 }
 
+func TestExport_EmptyMetricName_ReturnsInvalidArgument(t *testing.T) {
+	store := &mockMetricsStore{}
+	srv := newServer("test", store)
+
+	_, err := srv.Export(context.Background(), exportGaugeRequest("svc", "", 1.0))
+
+	if err == nil {
+		t.Fatal("expected error for empty metric name, got nil")
+	}
+	if status.Code(err) != grpccodes.InvalidArgument {
+		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
+	}
+	if store.insertGaugeCalls != 0 {
+		t.Error("InsertGauge must not be called when validation fails")
+	}
+}
+
+func TestExport_EmptyMetricNameInBatch_ReturnsInvalidArgument(t *testing.T) {
+	// Validates that an empty name is caught even when it appears after valid metrics in the batch.
+	store := &mockMetricsStore{}
+	srv := newServer("test", store)
+
+	now := uint64(time.Now().UnixNano())
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{
+				ScopeMetrics: []*metricspb.ScopeMetrics{
+					{
+						Metrics: []*metricspb.Metric{
+							{Name: "valid.metric", Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+								DataPoints: []*metricspb.NumberDataPoint{{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}}},
+							}}},
+							{Name: "", Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+								DataPoints: []*metricspb.NumberDataPoint{{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 2.0}}},
+							}}},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := srv.Export(context.Background(), req)
+
+	if err == nil {
+		t.Fatal("expected error for empty metric name in batch, got nil")
+	}
+	if status.Code(err) != grpccodes.InvalidArgument {
+		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
+	}
+	if store.insertGaugeCalls != 0 {
+		t.Error("InsertGauge must not be called when validation fails")
+	}
+}
+
+func TestExport_GaugeZeroTimeUnixNano_ReturnsInvalidArgument(t *testing.T) {
+	store := &mockMetricsStore{}
+	srv := newServer("test", store)
+
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{ScopeMetrics: []*metricspb.ScopeMetrics{
+				{Metrics: []*metricspb.Metric{
+					{Name: "cpu.usage", Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{
+						DataPoints: []*metricspb.NumberDataPoint{
+							{TimeUnixNano: 0, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+						},
+					}}},
+				}},
+			}},
+		},
+	}
+
+	_, err := srv.Export(context.Background(), req)
+
+	if err == nil {
+		t.Fatal("expected error for gauge data point with time_unix_nano=0, got nil")
+	}
+	if status.Code(err) != grpccodes.InvalidArgument {
+		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
+	}
+	if store.insertGaugeCalls != 0 {
+		t.Error("InsertGauge must not be called when validation fails")
+	}
+}
+
+func TestExport_SumZeroTimeUnixNano_ReturnsInvalidArgument(t *testing.T) {
+	store := &mockMetricsStore{}
+	srv := newServer("test", store)
+
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{ScopeMetrics: []*metricspb.ScopeMetrics{
+				{Metrics: []*metricspb.Metric{
+					{Name: "requests.total", Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+						DataPoints: []*metricspb.NumberDataPoint{
+							{TimeUnixNano: 0, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+						},
+					}}},
+				}},
+			}},
+		},
+	}
+
+	_, err := srv.Export(context.Background(), req)
+
+	if err == nil {
+		t.Fatal("expected error for sum data point with time_unix_nano=0, got nil")
+	}
+	if status.Code(err) != grpccodes.InvalidArgument {
+		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
+	}
+	if store.insertSumCalls != 0 {
+		t.Error("InsertSum must not be called when validation fails")
+	}
+}
+
+func TestExport_SumUnspecifiedAggregationTemporality_ReturnsInvalidArgument(t *testing.T) {
+	store := &mockMetricsStore{}
+	srv := newServer("test", store)
+
+	now := uint64(time.Now().UnixNano())
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{ScopeMetrics: []*metricspb.ScopeMetrics{
+				{Metrics: []*metricspb.Metric{
+					{Name: "requests.total", Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_UNSPECIFIED,
+						DataPoints: []*metricspb.NumberDataPoint{
+							{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+						},
+					}}},
+				}},
+			}},
+		},
+	}
+
+	_, err := srv.Export(context.Background(), req)
+
+	if err == nil {
+		t.Fatal("expected error for sum with UNSPECIFIED aggregation_temporality, got nil")
+	}
+	if status.Code(err) != grpccodes.InvalidArgument {
+		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
+	}
+	if store.insertSumCalls != 0 {
+		t.Error("InsertSum must not be called when validation fails")
+	}
+}
+
+func TestExport_SumDeltaTemporality_Accepted(t *testing.T) {
+	store := &mockMetricsStore{}
+	srv := newServer("test", store)
+
+	_, err := srv.Export(context.Background(), exportSumRequest("svc", "requests.total", 1.0))
+
+	if err != nil {
+		t.Fatalf("expected valid sum (CUMULATIVE) to be accepted, got: %v", err)
+	}
+
+	now := uint64(time.Now().UnixNano())
+	deltaReq := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{ScopeMetrics: []*metricspb.ScopeMetrics{
+				{Metrics: []*metricspb.Metric{
+					{Name: "requests.total", Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{
+						AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_DELTA,
+						DataPoints: []*metricspb.NumberDataPoint{
+							{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+						},
+					}}},
+				}},
+			}},
+		},
+	}
+	_, err = srv.Export(context.Background(), deltaReq)
+	if err != nil {
+		t.Fatalf("expected valid sum (DELTA) to be accepted, got: %v", err)
+	}
+}
+
 func TestExport_MetadataHashMatchesDatapointHash(t *testing.T) {
 	store := &mockMetricsStore{}
 	srv := newServer("test", store)
