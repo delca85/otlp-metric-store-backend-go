@@ -8,6 +8,9 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -31,7 +34,7 @@ var (
 	clickhousePassword = flag.String("clickhouse-password", "", "ClickHouse password")
 )
 
-const name = "dash0.com/otlp-log-processor-backend"
+const name = "dash0.com/otlp-metrics-processor-backend"
 
 var (
 	meter                  = otel.Meter(name)
@@ -100,7 +103,22 @@ func run() (err error) {
 	)
 	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer(*listenAddr, store))
 
-	slog.Debug("Starting gRPC server")
+	slog.Info("gRPC server listening", slog.String("addr", *listenAddr))
 
-	return grpcServer.Serve(listener)
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- grpcServer.Serve(listener)
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+
+	select {
+	case sig := <-quit:
+		slog.Info("Shutdown signal received, stopping gRPC server", slog.String("signal", sig.String()))
+		grpcServer.GracefulStop()
+	case err = <-serverErr:
+		return err
+	}
+	return nil
 }

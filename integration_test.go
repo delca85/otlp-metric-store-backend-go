@@ -157,7 +157,8 @@ func TestInsertGauge(t *testing.T) {
 		value      float64
 	)
 	err := store.conn.QueryRow(ctx,
-		"SELECT MetricHash, Value FROM otel_metrics_gauge",
+		"SELECT MetricHash, Value FROM otel_metrics_gauge WHERE MetricHash = $1",
+		rows[0].MetricHash,
 	).Scan(&metricHash, &value)
 	if err != nil {
 		t.Fatalf("querying otel_metrics_gauge: %v", err)
@@ -261,7 +262,8 @@ func TestInsertSum(t *testing.T) {
 		isMonotonic            bool
 	)
 	err := store.conn.QueryRow(ctx,
-		"SELECT MetricHash, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum",
+		"SELECT MetricHash, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum WHERE MetricHash = $1",
+		rows[0].GaugeRow.MetricHash,
 	).Scan(&metricHash, &value, &aggregationTemporality, &isMonotonic)
 	if err != nil {
 		t.Fatalf("querying otel_metrics_sum: %v", err)
@@ -293,6 +295,78 @@ func TestInsertSum(t *testing.T) {
 	}
 	if metaSvcName != "test-service" {
 		t.Errorf("expected ServiceName=test-service, got %s", metaSvcName)
+	}
+}
+
+// TestInsertMetadata_AnyLastSemantics verifies that when the same MetricHash is inserted
+// twice with a different MetricDescription, the AggregatingMergeTree's anyLast semantics
+// keep the most recently inserted value. MetricDescription is not part of the hash identity,
+// so it can change independently without creating a new series.
+func TestInsertMetadata_AnyLastSemantics(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	now := uint64(time.Now().UnixNano())
+
+	makeRM := func(description string) []*metricspb.ResourceMetrics {
+		return []*metricspb.ResourceMetrics{
+			{
+				Resource: &resourcepb.Resource{
+					Attributes: []*commonpb.KeyValue{
+						{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "anylast-service"}}},
+					},
+				},
+				ScopeMetrics: []*metricspb.ScopeMetrics{
+					{
+						Scope: &commonpb.InstrumentationScope{Name: "anylast-scope"},
+						Metrics: []*metricspb.Metric{
+							{
+								Name:        "anylast.gauge",
+								Description: description,
+								Data: &metricspb.Metric_Gauge{
+									Gauge: &metricspb.Gauge{
+										DataPoints: []*metricspb.NumberDataPoint{
+											{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	rows1, metadata1 := MapGaugeRows(makeRM("v1 description"))
+	if err := store.InsertGauge(ctx, rows1, metadata1); err != nil {
+		t.Fatalf("first insert: %v", err)
+	}
+
+	rows2, metadata2 := MapGaugeRows(makeRM("v2 description"))
+	if rows1[0].MetricHash != rows2[0].MetricHash {
+		t.Fatalf("expected same MetricHash for same identity, got %d vs %d", rows1[0].MetricHash, rows2[0].MetricHash)
+	}
+	if err := store.InsertGauge(ctx, rows2, metadata2); err != nil {
+		t.Fatalf("second insert: %v", err)
+	}
+
+	// FINAL forces merge; anyLast should retain the most recently inserted MetricDescription.
+	var desc string
+	err := store.conn.QueryRow(ctx,
+		"SELECT MetricDescription FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		rows1[0].MetricHash,
+	).Scan(&desc)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if desc != "v2 description" {
+		t.Errorf("expected anyLast to keep 'v2 description', got %q", desc)
 	}
 }
 
@@ -361,6 +435,119 @@ func TestInsertMetadata(t *testing.T) {
 	}
 }
 
+func TestGRPCToClickHouseSum(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	lis := bufconn.Listen(1024 * 1024)
+	grpcServer := grpc.NewServer()
+	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer("bufconn", store))
+	go func() {
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Printf("error serving server: %v", err)
+		}
+	}()
+	defer grpcServer.Stop()
+
+	conn, err := grpc.NewClient("passthrough://bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("connecting to grpc server: %v", err)
+	}
+	defer conn.Close()
+
+	client := colmetricspb.NewMetricsServiceClient(conn)
+
+	now := uint64(time.Now().UnixNano())
+	sumResourceMetrics := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "e2e-sum-service"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "e2e-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "e2e.requests.total",
+							Data: &metricspb.Metric_Sum{
+								Sum: &metricspb.Sum{
+									AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+									IsMonotonic:            true,
+									DataPoints: []*metricspb.NumberDataPoint{
+										{
+											TimeUnixNano: now,
+											Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: 42.0},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Pre-compute expected MetricHash before sending so we can query deterministically.
+	expectedSumRows, _ := MapSumRows(sumResourceMetrics)
+	if len(expectedSumRows) == 0 {
+		t.Fatal("expected at least one sum row from MapSumRows")
+	}
+	expectedSumHash := expectedSumRows[0].GaugeRow.MetricHash
+
+	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: sumResourceMetrics,
+	})
+	if err != nil {
+		t.Fatalf("exporting sum metric via grpc: %v", err)
+	}
+
+	// Verify the datapoint landed in otel_metrics_sum.
+	var (
+		metricHash  uint64
+		value       float64
+		isMonotonic bool
+	)
+	err = store.conn.QueryRow(ctx,
+		"SELECT MetricHash, Value, IsMonotonic FROM otel_metrics_sum WHERE MetricHash = $1",
+		expectedSumHash,
+	).Scan(&metricHash, &value, &isMonotonic)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_sum: %v", err)
+	}
+	if value != 42.0 {
+		t.Errorf("expected Value=42.0, got %f", value)
+	}
+	if !isMonotonic {
+		t.Errorf("expected IsMonotonic=true")
+	}
+
+	// Verify the metadata is resolvable via the MetricHash.
+	var metaSvcName string
+	err = store.conn.QueryRow(ctx,
+		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		metricHash,
+	).Scan(&metaSvcName)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if metaSvcName != "e2e-sum-service" {
+		t.Errorf("expected ServiceName=e2e-sum-service, got %s", metaSvcName)
+	}
+}
+
 func TestGRPCToClickHouse(t *testing.T) {
 	store, cleanup := setupClickHouse(t)
 	defer cleanup()
@@ -394,29 +581,27 @@ func TestGRPCToClickHouse(t *testing.T) {
 
 	client := colmetricspb.NewMetricsServiceClient(conn)
 
-	// Send a gauge metric via gRPC.
+	// Build gauge resource metrics once so we can derive the expected MetricHash before sending.
 	now := uint64(time.Now().UnixNano())
-	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricspb.ResourceMetrics{
-			{
-				Resource: &resourcepb.Resource{
-					Attributes: []*commonpb.KeyValue{
-						{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "e2e-service"}}},
-					},
+	gaugeResourceMetrics := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "e2e-service"}}},
 				},
-				ScopeMetrics: []*metricspb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{Name: "e2e-scope"},
-						Metrics: []*metricspb.Metric{
-							{
-								Name: "e2e.gauge",
-								Data: &metricspb.Metric_Gauge{
-									Gauge: &metricspb.Gauge{
-										DataPoints: []*metricspb.NumberDataPoint{
-											{
-												TimeUnixNano: now,
-												Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: 99.9},
-											},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "e2e-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "e2e.gauge",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{
+											TimeUnixNano: now,
+											Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: 99.9},
 										},
 									},
 								},
@@ -426,6 +611,17 @@ func TestGRPCToClickHouse(t *testing.T) {
 				},
 			},
 		},
+	}
+
+	// Pre-compute expected MetricHash before sending so we can query deterministically.
+	expectedGaugeRows, _ := MapGaugeRows(gaugeResourceMetrics)
+	if len(expectedGaugeRows) == 0 {
+		t.Fatal("expected at least one gauge row from MapGaugeRows")
+	}
+	expectedGaugeHash := expectedGaugeRows[0].MetricHash
+
+	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: gaugeResourceMetrics,
 	})
 	if err != nil {
 		t.Fatalf("exporting metrics via grpc: %v", err)
@@ -437,7 +633,8 @@ func TestGRPCToClickHouse(t *testing.T) {
 		value      float64
 	)
 	err = store.conn.QueryRow(ctx,
-		"SELECT MetricHash, Value FROM otel_metrics_gauge WHERE Value = 99.9",
+		"SELECT MetricHash, Value FROM otel_metrics_gauge WHERE MetricHash = $1",
+		expectedGaugeHash,
 	).Scan(&metricHash, &value)
 	if err != nil {
 		t.Fatalf("querying otel_metrics_gauge: %v", err)

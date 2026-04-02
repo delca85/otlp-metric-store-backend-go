@@ -29,6 +29,17 @@ SETTINGS index_granularity = 8192;
 `
 
 // createGaugeTableSQL defines slim gauge datapoints referencing the metadata table via MetricHash.
+// ORDER BY design contract: (MetricHash, TimeUnix) places MetricHash first so that queries
+// filtered by MetricHash — the expected access pattern after a metadata lookup — use the
+// primary index efficiently. Daily partitioning on TimeUnix bounds the scan to a single
+// partition per calendar day for any time-range query.
+//
+// Trade-off: a pure time-range scan across all metrics (no MetricHash filter) must read all
+// granules within the matching partitions. The intended query flow is:
+//   1. Query otel_metrics_metadata FINAL for the time window → get a set of MetricHash values.
+//   2. Query this table WHERE MetricHash IN (...) AND TimeUnix BETWEEN x AND y.
+// If cross-metric time-range scans without a prior metadata lookup become a requirement,
+// consider reversing the ORDER BY to (TimeUnix, MetricHash) or adding a materialized view.
 const createGaugeTableSQL = `
 CREATE TABLE IF NOT EXISTS otel_metrics_gauge (
     MetricHash     UInt64,

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -203,8 +205,7 @@ func TestExport_NilStore_DoesNotPanic(t *testing.T) {
 }
 
 func TestExport_InsertGaugeError_ReturnsError(t *testing.T) {
-	sentinel := errors.New("clickhouse unavailable")
-	store := &mockMetricsStore{insertGaugeErr: sentinel}
+	store := &mockMetricsStore{insertGaugeErr: errors.New("clickhouse unavailable")}
 	srv := newServer("test", store)
 
 	_, err := srv.Export(context.Background(), exportGaugeRequest("svc", "m", 1.0))
@@ -212,14 +213,13 @@ func TestExport_InsertGaugeError_ReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from Export when InsertGauge fails, got nil")
 	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected sentinel error, got %v", err)
+	if status.Code(err) != grpccodes.Internal {
+		t.Errorf("expected gRPC Internal status, got %v", err)
 	}
 }
 
 func TestExport_InsertSumError_ReturnsError(t *testing.T) {
-	sentinel := errors.New("clickhouse unavailable")
-	store := &mockMetricsStore{insertSumErr: sentinel}
+	store := &mockMetricsStore{insertSumErr: errors.New("clickhouse unavailable")}
 	srv := newServer("test", store)
 
 	_, err := srv.Export(context.Background(), exportSumRequest("svc", "m", 1.0))
@@ -227,8 +227,8 @@ func TestExport_InsertSumError_ReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from Export when InsertSum fails, got nil")
 	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("expected sentinel error, got %v", err)
+	if status.Code(err) != grpccodes.Internal {
+		t.Errorf("expected gRPC Internal status, got %v", err)
 	}
 }
 

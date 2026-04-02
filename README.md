@@ -39,7 +39,9 @@ Metric identity (name, service, attributes) is extracted once into `otel_metrics
 
 This eliminates per-datapoint attribute storage while keeping JOINs fast: metadata cardinality is expected to be low and the table fits in memory for broadcast joins.
 
-**Hashing key:** `MetricName | ServiceName | sorted(ResourceAttributes) | sorted(ScopeAttributes) | sorted(Attributes)`
+**Hashing key:** `MetricName \x00 ServiceName \x00 sorted(ResourceAttributes) \x00 sorted(ScopeAttributes) \x00 sorted(Attributes)`
+
+Fields are separated by `\x00`, map entries by `\x01`, and key-value pairs by `\x02` — ASCII control characters that cannot appear in valid UTF-8 OTLP strings, making the encoding unambiguous regardless of field content.
 
 **Tables created on startup:**
 
@@ -98,7 +100,7 @@ make build
 ```shell
 go run ./...
 # or
-./otlp-log-processor-backend
+./otlp-metrics-processor-backend
 ```
 
 ### CLI flags
@@ -115,7 +117,7 @@ go run ./...
 **Example:**
 
 ```shell
-./otlp-log-processor-backend \
+./otlp-metrics-processor-backend \
   -listenAddr 0.0.0.0:4317 \
   -clickhouse-addr clickhouse:9000 \
   -clickhouse-db metrics \
@@ -207,6 +209,22 @@ make clean   # go clean
 ---
 
 ## Future Improvements
+
+### TLS support for gRPC transport
+
+The gRPC server currently uses `insecure.NewCredentials()`. For production, it should accept `-tls-cert` / `-tls-key` flags and load `credentials.NewTLS(...)`. The insecure mode should only apply when an explicit `--insecure` flag is passed.
+
+### Password and secrets via environment variables or files
+
+The `-clickhouse-password` CLI flag is visible in `ps aux` to co-tenant processes. A production deployment should prefer `CLICKHOUSE_PASSWORD` environment variable or a `-clickhouse-password-file` flag that reads from a file (compatible with Kubernetes secret volume mounts).
+
+### Application-level write buffer
+
+For sustained very-high-throughput scenarios, an in-process ring buffer (channel + flush goroutine) that accumulates rows across multiple gRPC calls and flushes in large batches on a timer or size threshold would reduce ClickHouse write amplification further. The current `async_insert=1` delegation is simpler and sufficient at moderate rates.
+
+### gRPC health check endpoint
+
+Register `grpc_health_v1` so Kubernetes liveness and readiness probes have a standard target. This also enables load-balancer health checks in service meshes.
 
 ### Secondary skip indexes for `otel_metrics_metadata`
 

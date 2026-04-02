@@ -10,6 +10,77 @@ import (
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 )
 
+// --- anyValueToString ---
+
+func TestAnyValueToString_Types(t *testing.T) {
+	cases := []struct {
+		name string
+		v    *commonpb.AnyValue
+		want string
+	}{
+		{"nil", nil, ""},
+		{"string", &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "hello"}}, "hello"},
+		{"int", &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 42}}, "42"},
+		{"double", &commonpb.AnyValue{Value: &commonpb.AnyValue_DoubleValue{DoubleValue: 3.14}}, "3.14"},
+		{"bool_true", &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: true}}, "true"},
+		{"bool_false", &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: false}}, "false"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := anyValueToString(c.v)
+			if got != c.want {
+				t.Errorf("anyValueToString: got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestAnyValueToString_UnknownType_DoesNotPanic(t *testing.T) {
+	// BytesValue falls through to the default branch; we only assert no panic and non-empty output.
+	v := &commonpb.AnyValue{Value: &commonpb.AnyValue_BytesValue{BytesValue: []byte("raw")}}
+	got := anyValueToString(v)
+	if got == "" {
+		t.Error("expected non-empty fallback string for unknown AnyValue type, got empty")
+	}
+}
+
+// --- serviceName ---
+
+func TestServiceName_EdgeCases(t *testing.T) {
+	cases := []struct {
+		name     string
+		resource *resourcepb.Resource
+		want     string
+	}{
+		{"nil resource", nil, ""},
+		{"no attributes", &resourcepb.Resource{}, ""},
+		{"missing service.name key", &resourcepb.Resource{
+			Attributes: []*commonpb.KeyValue{
+				{Key: "host.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "host-1"}}},
+			},
+		}, ""},
+		{"service.name present", &resourcepb.Resource{
+			Attributes: []*commonpb.KeyValue{
+				{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "my-svc"}}},
+			},
+		}, "my-svc"},
+		// GetStringValue() returns "" when the underlying value is not a string.
+		{"service.name is non-string (int)", &resourcepb.Resource{
+			Attributes: []*commonpb.KeyValue{
+				{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: 42}}},
+			},
+		}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := serviceName(c.resource)
+			if got != c.want {
+				t.Errorf("serviceName: got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 // --- computeMetricHash ---
 
 func TestComputeMetricHash_Deterministic(t *testing.T) {
@@ -86,10 +157,16 @@ func TestComputeMetricHash_ScopeAndAttrsArePartOfIdentity(t *testing.T) {
 func TestWriteMapSorted_ProducesSortedOutput(t *testing.T) {
 	var b strings.Builder
 	writeMapSorted(&b, map[string]string{"z": "3", "a": "1", "m": "2"})
-	got := b.String()
-	want := "a=1,m=2,z=3"
-	if got != want {
-		t.Errorf("writeMapSorted: got %q, want %q", got, want)
+	parts := strings.Split(b.String(), string(entrySep))
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(parts))
+	}
+	want := []struct{ k, v string }{{"a", "1"}, {"m", "2"}, {"z", "3"}}
+	for i, p := range parts {
+		kv := strings.SplitN(p, string(kvSep), 2)
+		if len(kv) != 2 || kv[0] != want[i].k || kv[1] != want[i].v {
+			t.Errorf("entry %d: got %q, want key=%q value=%q", i, p, want[i].k, want[i].v)
+		}
 	}
 }
 

@@ -7,6 +7,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"golang.org/x/sync/errgroup"
 )
 
 type dash0MetricsServiceServer struct {
@@ -31,23 +34,24 @@ func (m *dash0MetricsServiceServer) Export(ctx context.Context, request *colmetr
 		rm := request.GetResourceMetrics()
 
 		gaugeRows, gaugeMetadata := MapGaugeRows(rm)
-		span.SetAttributes(attribute.Int("metric.gauge.count", len(gaugeRows)))
-		if len(gaugeRows) > 0 {
-			if err := m.store.InsertGauge(ctx, gaugeRows, gaugeMetadata); err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return nil, err
-			}
-		}
-
 		sumRows, sumMetadata := MapSumRows(rm)
-		span.SetAttributes(attribute.Int("metric.sum.count", len(sumRows)))
+		span.SetAttributes(
+			attribute.Int("metric.gauge.count", len(gaugeRows)),
+			attribute.Int("metric.sum.count", len(sumRows)),
+		)
+
+		g, gctx := errgroup.WithContext(ctx)
+		if len(gaugeRows) > 0 {
+			g.Go(func() error { return m.store.InsertGauge(gctx, gaugeRows, gaugeMetadata) })
+		}
 		if len(sumRows) > 0 {
-			if err := m.store.InsertSum(ctx, sumRows, sumMetadata); err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-				return nil, err
-			}
+			g.Go(func() error { return m.store.InsertSum(gctx, sumRows, sumMetadata) })
+		}
+		if err := g.Wait(); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			slog.ErrorContext(ctx, "failed to insert metrics", slog.Any("error", err))
+			return nil, status.Error(grpccodes.Internal, "failed to store metrics")
 		}
 	}
 

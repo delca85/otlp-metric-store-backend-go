@@ -70,28 +70,53 @@ func numberDataPointValue(dp *metricspb.NumberDataPoint) float64 {
 	}
 }
 
+// metadataKey uniquely identifies a metadata row per (hash, day) — matching the
+// AggregatingMergeTree ORDER BY (TimeUnix Date, MetricName, MetricHash).
+// Using date granularity ensures one metadata row is emitted per day per series,
+// which is the dedup unit the engine merges on.
+type metadataKey struct {
+	hash uint64
+	date time.Time // truncated to UTC midnight
+}
+
+// truncateToDay returns t truncated to midnight UTC, matching the Date column
+// granularity used by otel_metrics_metadata's TimeUnix column and ORDER BY key.
+func truncateToDay(t time.Time) time.Time {
+	y, m, d := t.UTC().Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// Separator bytes used in the canonical hash string. ASCII control characters are chosen
+// because they cannot appear in valid UTF-8 OTLP strings (metric names, attribute keys/values).
+// Using distinct bytes for each role makes the encoding unambiguous regardless of field content.
+const (
+	fieldSep = '\x00' // separates top-level identity fields
+	entrySep = '\x01' // separates key=value pairs within a map
+	kvSep    = '\x02' // separates a key from its value
+)
+
 // computeMetricHash returns xxHash64 of the canonical series identity string:
 //
-//	MetricName|ServiceName|sorted(ResourceAttributes)|sorted(ScopeAttributes)|sorted(Attributes)
+//	MetricName\x00ServiceName\x00sorted(ResourceAttributes)\x00sorted(ScopeAttributes)\x00sorted(Attributes)
 //
-// Maps are serialized as key=value,key=value,... with keys sorted ascending so that
+// Maps are serialized as key\x02value\x01key\x02value,... with keys sorted ascending so that
 // the same attribute set always produces the same hash regardless of Go map iteration order.
 // MetricType is intentionally excluded — it is a property of the series, not part of its identity.
 func computeMetricHash(metricName, svcName string, resourceAttrs, scopeAttrs, attrs map[string]string) uint64 {
 	var b strings.Builder
 	b.WriteString(metricName)
-	b.WriteByte('|')
+	b.WriteByte(fieldSep)
 	b.WriteString(svcName)
-	b.WriteByte('|')
+	b.WriteByte(fieldSep)
 	writeMapSorted(&b, resourceAttrs)
-	b.WriteByte('|')
+	b.WriteByte(fieldSep)
 	writeMapSorted(&b, scopeAttrs)
-	b.WriteByte('|')
+	b.WriteByte(fieldSep)
 	writeMapSorted(&b, attrs)
 	return xxhash.Sum64String(b.String())
 }
 
-// writeMapSorted writes map entries to b as key=value,key=value,... with keys sorted ascending.
+// writeMapSorted writes map entries to b as key\x02value\x01key\x02value,... with keys sorted ascending.
 func writeMapSorted(b *strings.Builder, m map[string]string) {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -100,10 +125,10 @@ func writeMapSorted(b *strings.Builder, m map[string]string) {
 	sort.Strings(keys)
 	for i, k := range keys {
 		if i > 0 {
-			b.WriteByte(',')
+			b.WriteByte(entrySep)
 		}
 		b.WriteString(k)
-		b.WriteByte('=')
+		b.WriteByte(kvSep)
 		b.WriteString(m[k])
 	}
 }
@@ -114,7 +139,7 @@ func writeMapSorted(b *strings.Builder, m map[string]string) {
 func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) ([]GaugeRow, []MetadataRow) {
 	var rows []GaugeRow
 	var metadata []MetadataRow
-	seenHashes := make(map[uint64]struct{})
+	seenHashes := make(map[metadataKey]struct{})
 
 	for _, rm := range resourceMetrics {
 		svcName := serviceName(rm.GetResource())
@@ -141,8 +166,9 @@ func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) ([]GaugeRow, []M
 						Value:         numberDataPointValue(dp),
 						Flags:         dp.GetFlags(),
 					})
-					if _, seen := seenHashes[hash]; !seen {
-						seenHashes[hash] = struct{}{}
+					mKey := metadataKey{hash: hash, date: truncateToDay(t)}
+					if _, seen := seenHashes[mKey]; !seen {
+						seenHashes[mKey] = struct{}{}
 						metadata = append(metadata, MetadataRow{
 							TimeUnix:           t,
 							MetricHash:         hash,
@@ -171,7 +197,7 @@ func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) ([]GaugeRow, []M
 func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) ([]SumRow, []MetadataRow) {
 	var rows []SumRow
 	var metadata []MetadataRow
-	seenHashes := make(map[uint64]struct{})
+	seenHashes := make(map[metadataKey]struct{})
 
 	for _, rm := range resourceMetrics {
 		svcName := serviceName(rm.GetResource())
@@ -202,8 +228,9 @@ func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) ([]SumRow, []Metad
 						AggregationTemporality: int32(sum.GetAggregationTemporality()),
 						IsMonotonic:            sum.GetIsMonotonic(),
 					})
-					if _, seen := seenHashes[hash]; !seen {
-						seenHashes[hash] = struct{}{}
+					mKey := metadataKey{hash: hash, date: truncateToDay(t)}
+					if _, seen := seenHashes[mKey]; !seen {
+						seenHashes[mKey] = struct{}{}
 						metadata = append(metadata, MetadataRow{
 							TimeUnix:           t,
 							MetricHash:         hash,
