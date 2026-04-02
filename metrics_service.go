@@ -14,7 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-type dash0MetricsServiceServer struct {
+type metricsServiceServer struct {
 	addr  string
 	store MetricsStore
 
@@ -22,7 +22,7 @@ type dash0MetricsServiceServer struct {
 }
 
 func newServer(addr string, store MetricsStore) colmetricspb.MetricsServiceServer {
-	return &dash0MetricsServiceServer{addr: addr, store: store}
+	return &metricsServiceServer{addr: addr, store: store}
 }
 
 // validateResourceMetrics returns an InvalidArgument error for any OTLP spec violation found in rm:
@@ -68,7 +68,7 @@ func validateMetric(metric *metricspb.Metric) error {
 	return nil
 }
 
-func (m *dash0MetricsServiceServer) Export(ctx context.Context, request *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
+func (m *metricsServiceServer) Export(ctx context.Context, request *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
 	ctx, span := tracer.Start(ctx, "Export")
 	defer span.End()
 

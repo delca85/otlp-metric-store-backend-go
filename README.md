@@ -265,7 +265,7 @@ The service instruments itself using the OpenTelemetry Go SDK and exports to **s
 | Signal | What is recorded |
 |---|---|
 | **Traces** | One span per `Export()` call; child spans per batch insert — includes table name, batch size, error status |
-| **Metrics** | `com.dash0.homeexercise.metrics.received` (counter — increments once per `Export()` RPC call, not per datapoint), `metric_store.inserts_total` (counter, `{table, status}` labels), `metric_store.insert_duration_ms` (histogram) |
+| **Metrics** | `otlp.metrics.received` (counter — increments once per `Export()` RPC call, not per datapoint), `metric_store.inserts_total` (counter, `{table, status}` labels), `metric_store.insert_duration_ms` (histogram) |
 | **Logs** | Structured logs via `log/slog` |
 
 ---

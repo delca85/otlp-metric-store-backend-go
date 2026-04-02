@@ -35,7 +35,7 @@ func TestMetricsServiceServer_Export(t *testing.T) {
 				ResourceMetrics: []*otelmetrics.ResourceMetrics{
 					{
 						ScopeMetrics: []*otelmetrics.ScopeMetrics{},
-						SchemaUrl:    "dash0.com/otlp-metrics-processor-backend",
+						SchemaUrl:    "otlp-metrics-processor-backend",
 					},
 				},
 			},

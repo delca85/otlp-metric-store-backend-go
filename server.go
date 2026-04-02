@@ -34,7 +34,7 @@ var (
 	clickhousePassword = flag.String("clickhouse-password", "", "ClickHouse password")
 )
 
-const name = "dash0.com/otlp-metrics-processor-backend"
+const name = "otlp-metrics-processor-backend"
 
 var (
 	meter                  = otel.Meter(name)
@@ -47,7 +47,7 @@ func init() {
 	tracer = otel.Tracer(name)
 
 	var err error
-	metricsReceivedCounter, err = meter.Int64Counter("com.dash0.homeexercise.metrics.received",
+	metricsReceivedCounter, err = meter.Int64Counter("otlp.metrics.received",
 		metric.WithDescription("The number of metrics received by otlp-metrics-processor-backend"),
 		metric.WithUnit("{metric}"))
 	if err != nil {

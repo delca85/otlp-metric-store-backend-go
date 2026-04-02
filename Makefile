@@ -1,4 +1,4 @@
-MODULE := dash0.com/otlp-metrics-processor-backend
+MODULE := otlp-metrics-processor-backend
 
 .PHONY: build run test test-integration test-all fmt vet lint tidy clean
 
@@ -12,7 +12,7 @@ test:
 	go tool gotestsum --format testname -- ./...
 
 test-integration:
-	go test -tags integration -count=1 -v ./...
+	go tool gotestsum --format testname ./ -test.timeout 10m -test.parallel=2  -tags integration -count=1 -v ./...
 
 test-all: test test-integration
 
