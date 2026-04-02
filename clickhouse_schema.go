@@ -1,5 +1,7 @@
 package main
 
+import "fmt"
+
 // createMetadataTableSQL defines the shared metadata lookup table.
 // Engine: AggregatingMergeTree — on merge, aggregates columns per (TimeUnix, MetricName, MetricHash).
 // Mutable fields (description, unit, type, attributes) use SimpleAggregateFunction(anyLast, T) to
@@ -8,7 +10,7 @@ package main
 // Note: Map key type falls back to plain String inside SimpleAggregateFunction — LowCardinality
 // is not supported as a Map key type within SAF wrappers.
 // Queries against this table should use FINAL to force merge completion before reading.
-const createMetadataTableSQL = `
+const createMetadataTableTemplate = `
 CREATE TABLE IF NOT EXISTS otel_metrics_metadata (
     TimeUnix            Date CODEC(Delta, LZ4),
     MetricHash          UInt64,
@@ -25,10 +27,11 @@ CREATE TABLE IF NOT EXISTS otel_metrics_metadata (
 ) ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(TimeUnix)
 ORDER BY (TimeUnix, MetricName, MetricHash)
+TTL TimeUnix + INTERVAL %d DAY
 SETTINGS index_granularity = 8192;
 `
 
-// createGaugeTableSQL defines slim gauge datapoints referencing the metadata table via MetricHash.
+// createGaugeTableTemplate defines slim gauge datapoints referencing the metadata table via MetricHash.
 // ORDER BY design contract: (TimeUnix, MetricHash) places TimeUnix first so that any time-range
 // query — the only mandatory filter per requirements — uses the primary index efficiently without
 // requiring a MetricHash pre-filter. Daily partitioning on TimeUnix further bounds scans to
@@ -37,7 +40,7 @@ SETTINGS index_granularity = 8192;
 // When a MetricHash filter is also present (e.g. after a metadata lookup), ClickHouse uses the
 // time range from the primary index to limit the scan and then applies MetricHash as a secondary
 // filter within those granules — still efficient for low-cardinality metrics.
-const createGaugeTableSQL = `
+const createGaugeTableTemplate = `
 CREATE TABLE IF NOT EXISTS otel_metrics_gauge (
     MetricHash     UInt64,
     StartTimeUnix  DateTime64(9) CODEC(Delta(8), LZ4),
@@ -47,11 +50,12 @@ CREATE TABLE IF NOT EXISTS otel_metrics_gauge (
 ) ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
 ORDER BY (toUnixTimestamp64Nano(TimeUnix), MetricHash)
+TTL toDateTime(TimeUnix) + INTERVAL %d DAY
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 `
 
-// createSumTableSQL defines slim sum datapoints. Extends gauge fields with sum-specific columns.
-const createSumTableSQL = `
+// createSumTableTemplate defines slim sum datapoints. Extends gauge fields with sum-specific columns.
+const createSumTableTemplate = `
 CREATE TABLE IF NOT EXISTS otel_metrics_sum (
     MetricHash              UInt64,
     StartTimeUnix           DateTime64(9) CODEC(Delta(8), LZ4),
@@ -63,11 +67,12 @@ CREATE TABLE IF NOT EXISTS otel_metrics_sum (
 ) ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
 ORDER BY (toUnixTimestamp64Nano(TimeUnix), MetricHash)
+TTL toDateTime(TimeUnix) + INTERVAL %d DAY
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 `
 
-// createHistogramTableSQL defines slim histogram datapoints. Insert logic not yet implemented.
-const createHistogramTableSQL = `
+// createHistogramTableTemplate defines slim histogram datapoints. Insert logic not yet implemented.
+const createHistogramTableTemplate = `
 CREATE TABLE IF NOT EXISTS otel_metrics_histogram (
     MetricHash              UInt64,
     StartTimeUnix           DateTime64(9) CODEC(Delta(8), LZ4),
@@ -83,11 +88,12 @@ CREATE TABLE IF NOT EXISTS otel_metrics_histogram (
 ) ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
 ORDER BY (toUnixTimestamp64Nano(TimeUnix), MetricHash)
+TTL toDateTime(TimeUnix) + INTERVAL %d DAY
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 `
 
-// createExponentialHistogramTableSQL defines slim exp-histogram datapoints. Insert logic not yet implemented.
-const createExponentialHistogramTableSQL = `
+// createExponentialHistogramTableTemplate defines slim exp-histogram datapoints. Insert logic not yet implemented.
+const createExponentialHistogramTableTemplate = `
 CREATE TABLE IF NOT EXISTS otel_metrics_exponential_histogram (
     MetricHash              UInt64,
     StartTimeUnix           DateTime64(9) CODEC(Delta(8), LZ4),
@@ -107,11 +113,12 @@ CREATE TABLE IF NOT EXISTS otel_metrics_exponential_histogram (
 ) ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
 ORDER BY (toUnixTimestamp64Nano(TimeUnix), MetricHash)
+TTL toDateTime(TimeUnix) + INTERVAL %d DAY
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 `
 
-// createSummaryTableSQL defines slim summary datapoints. Insert logic not yet implemented.
-const createSummaryTableSQL = `
+// createSummaryTableTemplate defines slim summary datapoints. Insert logic not yet implemented.
+const createSummaryTableTemplate = `
 CREATE TABLE IF NOT EXISTS otel_metrics_summary (
     MetricHash     UInt64,
     StartTimeUnix  DateTime64(9) CODEC(Delta(8), LZ4),
@@ -126,5 +133,18 @@ CREATE TABLE IF NOT EXISTS otel_metrics_summary (
 ) ENGINE = MergeTree()
 PARTITION BY toDate(TimeUnix)
 ORDER BY (toUnixTimestamp64Nano(TimeUnix), MetricHash)
+TTL toDateTime(TimeUnix) + INTERVAL %d DAY
 SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1;
 `
+
+// ddlStatements returns all CREATE TABLE statements formatted with the given retention period.
+func ddlStatements(retentionDays int) []string {
+	return []string{
+		fmt.Sprintf(createMetadataTableTemplate, retentionDays),
+		fmt.Sprintf(createGaugeTableTemplate, retentionDays),
+		fmt.Sprintf(createSumTableTemplate, retentionDays),
+		fmt.Sprintf(createHistogramTableTemplate, retentionDays),
+		fmt.Sprintf(createExponentialHistogramTableTemplate, retentionDays),
+		fmt.Sprintf(createSummaryTableTemplate, retentionDays),
+	}
+}

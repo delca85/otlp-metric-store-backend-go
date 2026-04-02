@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -49,6 +50,46 @@ type SumRow struct {
 	IsMonotonic            bool
 }
 
+// ClickHouseConfig holds all configuration for the ClickHouse store.
+// Zero values for numeric/duration fields fall back to sensible production defaults.
+type ClickHouseConfig struct {
+	Addr     string
+	Database string
+	Username string
+	Password string
+
+	// Connection pool settings. Zero values use defaults (10 open, 5 idle, 1h lifetime).
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+
+	// DataRetentionDays is the TTL for all datapoint and metadata tables.
+	// Zero defaults to 90 days.
+	DataRetentionDays int
+
+	// MaxRetries is the number of attempts for transient ClickHouse insert failures.
+	// Zero defaults to 3.
+	MaxRetries int
+}
+
+func (c *ClickHouseConfig) applyDefaults() {
+	if c.MaxOpenConns == 0 {
+		c.MaxOpenConns = 10
+	}
+	if c.MaxIdleConns == 0 {
+		c.MaxIdleConns = 5
+	}
+	if c.ConnMaxLifetime == 0 {
+		c.ConnMaxLifetime = time.Hour
+	}
+	if c.DataRetentionDays == 0 {
+		c.DataRetentionDays = 90
+	}
+	if c.MaxRetries == 0 {
+		c.MaxRetries = 3
+	}
+}
+
 // MetricsStore defines the interface for storing metrics in ClickHouse.
 type MetricsStore interface {
 	CreateTables(ctx context.Context) error
@@ -83,17 +124,23 @@ func init() {
 type ClickHouseMetricsStore struct {
 	conn   driver.Conn
 	tracer trace.Tracer
+	cfg    ClickHouseConfig
 }
 
 // NewClickHouseMetricsStore creates a new ClickHouseMetricsStore connected to the given address.
-func NewClickHouseMetricsStore(ctx context.Context, addr string, database string, username string, password string) (*ClickHouseMetricsStore, error) {
+func NewClickHouseMetricsStore(ctx context.Context, cfg ClickHouseConfig) (*ClickHouseMetricsStore, error) {
+	cfg.applyDefaults()
+
 	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{addr},
+		Addr: []string{cfg.Addr},
 		Auth: clickhouse.Auth{
-			Database: database,
-			Username: username,
-			Password: password,
+			Database: cfg.Database,
+			Username: cfg.Username,
+			Password: cfg.Password,
 		},
+		MaxOpenConns:    cfg.MaxOpenConns,
+		MaxIdleConns:    cfg.MaxIdleConns,
+		ConnMaxLifetime: cfg.ConnMaxLifetime,
 		Settings: clickhouse.Settings{
 			"max_execution_time": 60,
 			// Enable server-side async insert buffering: ClickHouse collects multiple
@@ -115,24 +162,54 @@ func NewClickHouseMetricsStore(ctx context.Context, addr string, database string
 	return &ClickHouseMetricsStore{
 		conn:   conn,
 		tracer: otel.Tracer(name),
+		cfg:    cfg,
 	}, nil
 }
 
 // CreateTables creates all metric tables if they do not already exist.
 func (s *ClickHouseMetricsStore) CreateTables(ctx context.Context) error {
-	for _, ddl := range []string{
-		createMetadataTableSQL,
-		createGaugeTableSQL,
-		createSumTableSQL,
-		createHistogramTableSQL,
-		createExponentialHistogramTableSQL,
-		createSummaryTableSQL,
-	} {
+	for _, ddl := range ddlStatements(s.cfg.DataRetentionDays) {
 		if err := s.conn.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("creating table: %w", err)
 		}
 	}
 	return nil
+}
+
+// retryWithBackoff calls op up to maxAttempts times, doubling the wait between attempts.
+// It stops immediately on context cancellation or a non-retriable error.
+func retryWithBackoff(ctx context.Context, maxAttempts int, op func() error) error {
+	backoff := 100 * time.Millisecond
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = op(); err == nil {
+			return nil
+		}
+		if !isRetriable(err) || attempt == maxAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return err
+}
+
+// isRetriable returns true for errors that may be transient (network, timeout).
+// Context cancellation and ClickHouse server-side exceptions are not retriable.
+func isRetriable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var chErr *clickhouse.Exception
+	if errors.As(err, &chErr) {
+		// ClickHouse server-side exceptions (positive codes) indicate data or schema errors.
+		return false
+	}
+	return true
 }
 
 // insertMetadata batch-inserts metadata rows into otel_metrics_metadata.
@@ -167,9 +244,17 @@ func (s *ClickHouseMetricsStore) insertMetadata(ctx context.Context, metadata []
 }
 
 // InsertGauge batch-inserts metadata rows and gauge datapoint rows.
-// Metadata is inserted first; if it fails the datapoints are not inserted, preventing
-// orphaned datapoint rows with no resolvable metadata.
+// The full operation is retried on transient failures. Metadata is inserted first; if it fails
+// the datapoints are not inserted, preventing orphaned datapoint rows with no resolvable metadata.
+// Both metadata and datapoint inserts are at-least-once safe: metadata is idempotent via
+// AggregatingMergeTree, and duplicate datapoints are acceptable for a metrics store.
 func (s *ClickHouseMetricsStore) InsertGauge(ctx context.Context, rows []GaugeRow, metadata []MetadataRow) error {
+	return retryWithBackoff(ctx, s.cfg.MaxRetries, func() error {
+		return s.insertGauge(ctx, rows, metadata)
+	})
+}
+
+func (s *ClickHouseMetricsStore) insertGauge(ctx context.Context, rows []GaugeRow, metadata []MetadataRow) error {
 	ctx, span := s.tracer.Start(ctx, "InsertGauge",
 		trace.WithAttributes(
 			attribute.String("db.system", "clickhouse"),
@@ -215,7 +300,14 @@ func (s *ClickHouseMetricsStore) InsertGauge(ctx context.Context, rows []GaugeRo
 }
 
 // InsertSum batch-inserts metadata rows and sum datapoint rows.
+// The full operation is retried on transient failures; see InsertGauge for retry semantics.
 func (s *ClickHouseMetricsStore) InsertSum(ctx context.Context, rows []SumRow, metadata []MetadataRow) error {
+	return retryWithBackoff(ctx, s.cfg.MaxRetries, func() error {
+		return s.insertSum(ctx, rows, metadata)
+	})
+}
+
+func (s *ClickHouseMetricsStore) insertSum(ctx context.Context, rows []SumRow, metadata []MetadataRow) error {
 	ctx, span := s.tracer.Start(ctx, "InsertSum",
 		trace.WithAttributes(
 			attribute.String("db.system", "clickhouse"),

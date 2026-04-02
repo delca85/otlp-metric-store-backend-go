@@ -48,7 +48,9 @@ func setupClickHouse(t *testing.T) (*ClickHouseMetricsStore, func()) {
 	require.NoError(t, err, "getting mapped port")
 
 	addr := fmt.Sprintf("%s:%s", host, mappedPort.Port())
-	store, err := NewClickHouseMetricsStore(ctx, addr, "default", "default", "test")
+	store, err := NewClickHouseMetricsStore(ctx, ClickHouseConfig{
+		Addr: addr, Database: "default", Username: "default", Password: "test",
+	})
 	require.NoError(t, err, "creating clickhouse metrics store")
 
 	cleanup := func() {
