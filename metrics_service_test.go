@@ -7,11 +7,11 @@ import (
 	"time"
 
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
-	grpccodes "google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	grpccodes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // mockMetricsStore records the arguments passed to InsertGauge and InsertSum so tests

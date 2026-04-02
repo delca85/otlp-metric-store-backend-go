@@ -7,9 +7,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	"golang.org/x/sync/errgroup"
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"golang.org/x/sync/errgroup"
 )
 
 type dash0MetricsServiceServer struct {

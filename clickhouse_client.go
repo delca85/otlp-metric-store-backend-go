@@ -19,12 +19,12 @@ import (
 // (TimeUnix, MetricName, MetricHash) key: mutable fields use SimpleAggregateFunction(anyLast)
 // to keep the most recent value per column independently.
 type MetadataRow struct {
-	TimeUnix           time.Time         // Date of the datapoint (toDate granularity); first ORDER BY key
-	MetricHash         uint64            // xxHash64 of identity fields; join key to datapoint tables
+	TimeUnix           time.Time // Date of the datapoint (toDate granularity); first ORDER BY key
+	MetricHash         uint64    // xxHash64 of identity fields; join key to datapoint tables
 	MetricName         string
 	MetricDescription  string
 	MetricUnit         string
-	MetricType         string            // "Gauge", "Sum", "Histogram", "ExpHistogram", "Summary"
+	MetricType         string // "Gauge", "Sum", "Histogram", "ExpHistogram", "Summary"
 	ServiceName        string
 	ResourceAttributes map[string]string
 	ScopeAttributes    map[string]string
@@ -95,7 +95,7 @@ func NewClickHouseMetricsStore(ctx context.Context, addr string, database string
 			Password: password,
 		},
 		Settings: clickhouse.Settings{
-			"max_execution_time":    60,
+			"max_execution_time": 60,
 			// Enable server-side async insert buffering: ClickHouse collects multiple
 			// small inserts and flushes them together, providing cross-RPC batching
 			// without application-level buffering. wait_for_async_insert=1 keeps error

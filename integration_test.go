@@ -96,208 +96,6 @@ func TestCreateTables(t *testing.T) {
 	}
 }
 
-func TestInsertGauge(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
-
-	now := uint64(time.Now().UnixNano())
-	startTime := now - uint64(time.Minute)
-	resourceMetrics := []*metricspb.ResourceMetrics{
-		{
-			Resource: &resourcepb.Resource{
-				Attributes: []*commonpb.KeyValue{
-					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "test-service"}}},
-					{Key: "host.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "test-host"}}},
-				},
-			},
-			SchemaUrl: "https://opentelemetry.io/schemas/1.4.0",
-			ScopeMetrics: []*metricspb.ScopeMetrics{
-				{
-					Scope: &commonpb.InstrumentationScope{
-						Name:    "test-scope",
-						Version: "1.0.0",
-					},
-					Metrics: []*metricspb.Metric{
-						{
-							Name:        "cpu.utilization",
-							Description: "CPU utilization percentage",
-							Unit:        "%",
-							Data: &metricspb.Metric_Gauge{
-								Gauge: &metricspb.Gauge{
-									DataPoints: []*metricspb.NumberDataPoint{
-										{
-											Attributes:        []*commonpb.KeyValue{{Key: "cpu", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "0"}}}},
-											StartTimeUnixNano: startTime,
-											TimeUnixNano:      now,
-											Value:             &metricspb.NumberDataPoint_AsDouble{AsDouble: 42.5},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	rows, metadata := MapGaugeRows(resourceMetrics)
-	if err := store.InsertGauge(ctx, rows, metadata); err != nil {
-		t.Fatalf("inserting gauge rows: %v", err)
-	}
-
-	// Verify the datapoint row in otel_metrics_gauge.
-	var (
-		metricHash uint64
-		value      float64
-	)
-	err := store.conn.QueryRow(ctx,
-		"SELECT MetricHash, Value FROM otel_metrics_gauge WHERE MetricHash = $1",
-		rows[0].MetricHash,
-	).Scan(&metricHash, &value)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_gauge: %v", err)
-	}
-	if value != 42.5 {
-		t.Errorf("expected Value=42.5, got %f", value)
-	}
-	if metricHash == 0 {
-		t.Error("expected non-zero MetricHash in otel_metrics_gauge")
-	}
-
-	// Verify the metadata row in otel_metrics_metadata (FINAL forces merge before asserting).
-	var (
-		metaName    string
-		metaSvcName string
-		metaHash    uint64
-	)
-	err = store.conn.QueryRow(ctx,
-		"SELECT MetricName, ServiceName, MetricHash FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
-		metricHash,
-	).Scan(&metaName, &metaSvcName, &metaHash)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if metaName != "cpu.utilization" {
-		t.Errorf("expected MetricName=cpu.utilization, got %s", metaName)
-	}
-	if metaSvcName != "test-service" {
-		t.Errorf("expected ServiceName=test-service, got %s", metaSvcName)
-	}
-	if metaHash != metricHash {
-		t.Errorf("expected MetricHash to match gauge row, got %d vs %d", metaHash, metricHash)
-	}
-}
-
-func TestInsertSum(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
-
-	now := uint64(time.Now().UnixNano())
-	startTime := now - uint64(time.Minute)
-	resourceMetrics := []*metricspb.ResourceMetrics{
-		{
-			Resource: &resourcepb.Resource{
-				Attributes: []*commonpb.KeyValue{
-					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "test-service"}}},
-					{Key: "host.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "test-host"}}},
-				},
-			},
-			SchemaUrl: "https://opentelemetry.io/schemas/1.4.0",
-			ScopeMetrics: []*metricspb.ScopeMetrics{
-				{
-					Scope: &commonpb.InstrumentationScope{
-						Name:    "test-scope",
-						Version: "1.0.0",
-					},
-					Metrics: []*metricspb.Metric{
-						{
-							Name:        "http.requests.total",
-							Description: "Total HTTP requests",
-							Unit:        "{request}",
-							Data: &metricspb.Metric_Sum{
-								Sum: &metricspb.Sum{
-									AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
-									IsMonotonic:            true,
-									DataPoints: []*metricspb.NumberDataPoint{
-										{
-											Attributes: []*commonpb.KeyValue{
-												{Key: "method", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "GET"}}},
-												{Key: "status", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "200"}}},
-											},
-											StartTimeUnixNano: startTime,
-											TimeUnixNano:      now,
-											Value:             &metricspb.NumberDataPoint_AsDouble{AsDouble: 1234},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	rows, metadata := MapSumRows(resourceMetrics)
-	if err := store.InsertSum(ctx, rows, metadata); err != nil {
-		t.Fatalf("inserting sum rows: %v", err)
-	}
-
-	// Verify the datapoint row in otel_metrics_sum.
-	var (
-		metricHash             uint64
-		value                  float64
-		aggregationTemporality int32
-		isMonotonic            bool
-	)
-	err := store.conn.QueryRow(ctx,
-		"SELECT MetricHash, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum WHERE MetricHash = $1",
-		rows[0].GaugeRow.MetricHash,
-	).Scan(&metricHash, &value, &aggregationTemporality, &isMonotonic)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_sum: %v", err)
-	}
-	if value != 1234 {
-		t.Errorf("expected Value=1234, got %f", value)
-	}
-	if aggregationTemporality != 2 {
-		t.Errorf("expected AggregationTemporality=2, got %d", aggregationTemporality)
-	}
-	if !isMonotonic {
-		t.Errorf("expected IsMonotonic=true, got false")
-	}
-
-	// Verify the metadata row in otel_metrics_metadata.
-	var (
-		metaName    string
-		metaSvcName string
-	)
-	err = store.conn.QueryRow(ctx,
-		"SELECT MetricName, ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
-		metricHash,
-	).Scan(&metaName, &metaSvcName)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if metaName != "http.requests.total" {
-		t.Errorf("expected MetricName=http.requests.total, got %s", metaName)
-	}
-	if metaSvcName != "test-service" {
-		t.Errorf("expected ServiceName=test-service, got %s", metaSvcName)
-	}
-}
-
 // TestInsertMetadata_AnyLastSemantics verifies that when the same MetricHash is inserted
 // twice with a different MetricDescription, the AggregatingMergeTree's anyLast semantics
 // keep the most recently inserted value. MetricDescription is not part of the hash identity,
@@ -444,28 +242,8 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 		t.Fatalf("creating tables: %v", err)
 	}
 
-	lis := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer("bufconn", store))
-	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("error serving server: %v", err)
-		}
-	}()
-	defer grpcServer.Stop()
-
-	conn, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("connecting to grpc server: %v", err)
-	}
-	defer conn.Close()
-
-	client := colmetricspb.NewMetricsServiceClient(conn)
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
 
 	now := uint64(time.Now().UnixNano())
 	sumResourceMetrics := []*metricspb.ResourceMetrics{
@@ -507,7 +285,7 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 	}
 	expectedSumHash := expectedSumRows[0].GaugeRow.MetricHash
 
-	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: sumResourceMetrics,
 	})
 	if err != nil {
@@ -560,28 +338,8 @@ func TestGRPCMixedBatch(t *testing.T) {
 		t.Fatalf("creating tables: %v", err)
 	}
 
-	lis := bufconn.Listen(1024 * 1024)
-	grpcServer := grpc.NewServer()
-	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer("bufconn", store))
-	go func() {
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("error serving server: %v", err)
-		}
-	}()
-	defer grpcServer.Stop()
-
-	conn, err := grpc.NewClient("passthrough://bufnet",
-		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
-			return lis.Dial()
-		}),
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
-	if err != nil {
-		t.Fatalf("connecting to grpc server: %v", err)
-	}
-	defer conn.Close()
-
-	client := colmetricspb.NewMetricsServiceClient(conn)
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
 
 	now := uint64(time.Now().UnixNano())
 
@@ -634,7 +392,7 @@ func TestGRPCMixedBatch(t *testing.T) {
 	gaugeHash := expectedGaugeRows[0].MetricHash
 	sumHash := expectedSumRows[0].GaugeRow.MetricHash
 
-	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: mixedResourceMetrics,
 	})
 	if err != nil {
@@ -785,26 +543,18 @@ func TestResourceAttributeEvolution(t *testing.T) {
 	}
 }
 
-func TestGRPCToClickHouse(t *testing.T) {
-	store, cleanup := setupClickHouse(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
-
-	// Start gRPC server wired to the ClickHouse store.
+// setupGRPCServer starts a bufconn-backed gRPC server wired to store and returns a connected
+// MetricsServiceClient together with a teardown function. Callers must defer the teardown.
+func setupGRPCServer(t *testing.T, store MetricsStore) (colmetricspb.MetricsServiceClient, func()) {
+	t.Helper()
 	lis := bufconn.Listen(1024 * 1024)
 	grpcServer := grpc.NewServer()
 	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer("bufconn", store))
 	go func() {
 		if err := grpcServer.Serve(lis); err != nil {
-			log.Printf("error serving server: %v", err)
+			log.Printf("error serving grpc server: %v", err)
 		}
 	}()
-	defer grpcServer.Stop()
-
 	conn, err := grpc.NewClient("passthrough://bufnet",
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 			return lis.Dial()
@@ -814,9 +564,456 @@ func TestGRPCToClickHouse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connecting to grpc server: %v", err)
 	}
-	defer conn.Close()
+	return colmetricspb.NewMetricsServiceClient(conn), func() {
+		conn.Close()
+		grpcServer.Stop()
+	}
+}
 
-	client := colmetricspb.NewMetricsServiceClient(conn)
+// TestGRPC_NilResource_InsertsWithEmptyServiceName verifies that a ResourceMetrics entry with a
+// nil Resource does not panic and produces a row with ServiceName="" in both the datapoint and
+// metadata tables. The proto getter chain (GetResource().GetAttributes()) is nil-safe, so the
+// mapper falls through to an empty service name rather than crashing.
+func TestGRPC_NilResource_InsertsWithEmptyServiceName(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
+
+	now := uint64(time.Now().UnixNano())
+	rm := []*metricspb.ResourceMetrics{
+		{
+			Resource: nil, // intentionally absent
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "nil-resource-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "nil.resource.gauge",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
+	if err != nil {
+		t.Fatalf("Export with nil Resource returned unexpected error: %v", err)
+	}
+
+	expectedRows, _ := MapGaugeRows(rm)
+	if len(expectedRows) == 0 {
+		t.Fatal("expected mapper to produce a gauge row despite nil Resource")
+	}
+	hash := expectedRows[0].MetricHash
+
+	var svcName string
+	if err := store.conn.QueryRow(ctx,
+		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1", hash,
+	).Scan(&svcName); err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if svcName != "" {
+		t.Errorf("expected ServiceName=\"\" for nil Resource, got %q", svcName)
+	}
+}
+
+// TestGRPC_MissingServiceName_InsertsWithEmptyServiceName verifies that a Resource present but
+// lacking a "service.name" attribute produces a row with ServiceName="" — the mapper returns ""
+// when the attribute is absent rather than failing.
+func TestGRPC_MissingServiceName_InsertsWithEmptyServiceName(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
+
+	now := uint64(time.Now().UnixNano())
+	rm := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					// host.name is present but service.name is intentionally omitted.
+					{Key: "host.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "my-host"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "no-svcname-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "no.svcname.gauge",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 2.0}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
+	if err != nil {
+		t.Fatalf("Export without service.name returned unexpected error: %v", err)
+	}
+
+	expectedRows, _ := MapGaugeRows(rm)
+	if len(expectedRows) == 0 {
+		t.Fatal("expected mapper to produce a gauge row despite missing service.name")
+	}
+	hash := expectedRows[0].MetricHash
+
+	var svcName string
+	if err := store.conn.QueryRow(ctx,
+		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1", hash,
+	).Scan(&svcName); err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if svcName != "" {
+		t.Errorf("expected ServiceName=\"\" when service.name attribute is absent, got %q", svcName)
+	}
+}
+
+// TestGRPC_EmptyMetricName_InsertsWithEmptyName verifies that a metric with an empty name string
+// is accepted and stored as-is. The hash is computed with MetricName="" — it is stable and
+// non-zero — so the row is inserted and queryable via its hash.
+func TestGRPC_EmptyMetricName_InsertsWithEmptyName(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
+
+	now := uint64(time.Now().UnixNano())
+	rm := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "empty-name-svc"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "empty-name-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "", // intentionally empty
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 3.0}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
+	if err != nil {
+		t.Fatalf("Export with empty metric name returned unexpected error: %v", err)
+	}
+
+	expectedRows, _ := MapGaugeRows(rm)
+	if len(expectedRows) == 0 {
+		t.Fatal("expected mapper to produce a gauge row despite empty metric name")
+	}
+	hash := expectedRows[0].MetricHash
+
+	var metricName string
+	if err := store.conn.QueryRow(ctx,
+		"SELECT MetricName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1", hash,
+	).Scan(&metricName); err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if metricName != "" {
+		t.Errorf("expected MetricName=\"\" to be stored as-is, got %q", metricName)
+	}
+}
+
+// TestGRPC_NilDataPointValue_InsertsAsZero verifies that a NumberDataPoint whose Value oneof is
+// unset (nil) produces a row with Value=0. The numberDataPointValue helper returns 0 for
+// unrecognised oneof variants rather than panicking or dropping the datapoint.
+func TestGRPC_NilDataPointValue_InsertsAsZero(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
+
+	now := uint64(time.Now().UnixNano())
+	rm := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "nil-value-svc"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "nil-value-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "nil.value.gauge",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: nil}, // oneof unset
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
+	if err != nil {
+		t.Fatalf("Export with nil DataPoint Value returned unexpected error: %v", err)
+	}
+
+	expectedRows, _ := MapGaugeRows(rm)
+	if len(expectedRows) == 0 {
+		t.Fatal("expected mapper to produce a gauge row despite nil DataPoint Value")
+	}
+	hash := expectedRows[0].MetricHash
+
+	var value float64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT Value FROM otel_metrics_gauge WHERE MetricHash = $1", hash,
+	).Scan(&value); err != nil {
+		t.Fatalf("querying otel_metrics_gauge: %v", err)
+	}
+	if value != 0 {
+		t.Errorf("expected Value=0 for nil DataPoint Value oneof, got %f", value)
+	}
+}
+
+// TestGRPC_UnimplementedMetricType_SilentlyDropped verifies that sending a Histogram metric — a
+// type whose insert logic is not yet implemented — results in a successful RPC with no rows
+// written to any table. The current behaviour is a silent drop: no error, no PartialSuccess
+// rejection count.
+func TestGRPC_UnimplementedMetricType_SilentlyDropped(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
+
+	now := uint64(time.Now().UnixNano())
+	resp, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{
+				Resource: &resourcepb.Resource{
+					Attributes: []*commonpb.KeyValue{
+						{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "histogram-svc"}}},
+					},
+				},
+				ScopeMetrics: []*metricspb.ScopeMetrics{
+					{
+						Scope: &commonpb.InstrumentationScope{Name: "histogram-scope"},
+						Metrics: []*metricspb.Metric{
+							{
+								Name: "unimplemented.histogram",
+								Data: &metricspb.Metric_Histogram{
+									Histogram: &metricspb.Histogram{
+										AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+										DataPoints: []*metricspb.HistogramDataPoint{
+											{
+												TimeUnixNano: now,
+												Count:        10,
+												Sum:          func() *float64 { v := 100.0; return &v }(),
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Export with Histogram metric returned unexpected error: %v", err)
+	}
+	if ps := resp.GetPartialSuccess(); ps != nil && ps.GetRejectedDataPoints() > 0 {
+		t.Errorf("expected no rejected data points in PartialSuccess, got %d: %s",
+			ps.GetRejectedDataPoints(), ps.GetErrorMessage())
+	}
+
+	// No rows must appear in any metric or metadata table.
+	for _, table := range []string{"otel_metrics_gauge", "otel_metrics_sum", "otel_metrics_histogram", "otel_metrics_metadata"} {
+		var count uint64
+		if err := store.conn.QueryRow(ctx,
+			fmt.Sprintf("SELECT count() FROM %s", table), //nolint:gosec // table name is a hardcoded literal
+		).Scan(&count); err != nil {
+			t.Fatalf("querying %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Errorf("expected 0 rows in %s after Histogram export, got %d", table, count)
+		}
+	}
+}
+
+// TestGRPC_ValidAndUnimplementedTypeMixed_OnlyValidLands sends a single Export containing both a
+// Gauge (implemented) and a Histogram (not yet implemented) under the same resource. The Gauge
+// datapoint must land in otel_metrics_gauge; the Histogram must be silently dropped with no error.
+func TestGRPC_ValidAndUnimplementedTypeMixed_OnlyValidLands(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
+
+	now := uint64(time.Now().UnixNano())
+	rm := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "mixed-types-svc"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "mixed-types-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "mixed.types.gauge",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{TimeUnixNano: now, Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 7.0}},
+									},
+								},
+							},
+						},
+						{
+							Name: "mixed.types.histogram",
+							Data: &metricspb.Metric_Histogram{
+								Histogram: &metricspb.Histogram{
+									AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+									DataPoints: []*metricspb.HistogramDataPoint{
+										{
+											TimeUnixNano: now,
+											Count:        5,
+											Sum:          func() *float64 { v := 50.0; return &v }(),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
+	if err != nil {
+		t.Fatalf("Export with mixed metric types returned unexpected error: %v", err)
+	}
+
+	// The gauge datapoint must be present in otel_metrics_gauge.
+	expectedGaugeRows, _ := MapGaugeRows(rm)
+	if len(expectedGaugeRows) == 0 {
+		t.Fatal("expected mapper to produce a gauge row for the Gauge metric")
+	}
+	gaugeHash := expectedGaugeRows[0].MetricHash
+
+	var gaugeValue float64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT Value FROM otel_metrics_gauge WHERE MetricHash = $1", gaugeHash,
+	).Scan(&gaugeValue); err != nil {
+		t.Fatalf("querying otel_metrics_gauge: %v", err)
+	}
+	if gaugeValue != 7.0 {
+		t.Errorf("expected gauge Value=7.0, got %f", gaugeValue)
+	}
+
+	// The histogram table must remain empty — the datapoint was silently dropped.
+	var histCount uint64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT count() FROM otel_metrics_histogram",
+	).Scan(&histCount); err != nil {
+		t.Fatalf("querying otel_metrics_histogram: %v", err)
+	}
+	if histCount != 0 {
+		t.Errorf("expected 0 rows in otel_metrics_histogram, got %d", histCount)
+	}
+
+	// Exactly one metadata row must exist — for the gauge only.
+	var metaCount uint64
+	if err := store.conn.QueryRow(ctx,
+		"SELECT count() FROM otel_metrics_metadata FINAL",
+	).Scan(&metaCount); err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if metaCount != 1 {
+		t.Errorf("expected exactly 1 metadata row (gauge only), got %d", metaCount)
+	}
+}
+
+func TestGRPCToClickHouse(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	client, grpcCleanup := setupGRPCServer(t, store)
+	defer grpcCleanup()
 
 	// Build gauge resource metrics once so we can derive the expected MetricHash before sending.
 	now := uint64(time.Now().UnixNano())
@@ -857,7 +1054,7 @@ func TestGRPCToClickHouse(t *testing.T) {
 	}
 	expectedGaugeHash := expectedGaugeRows[0].MetricHash
 
-	_, err = client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
+	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: gaugeResourceMetrics,
 	})
 	if err != nil {
