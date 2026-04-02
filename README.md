@@ -208,6 +208,22 @@ make clean   # go clean
 
 ---
 
+## Known Limitations
+
+### Unimplemented metric types
+
+Insert logic is currently implemented only for **Gauge** and **Sum** metrics. The following types have table schemas defined but are **not yet handled** — datapoints of these types are silently dropped at ingest:
+
+| Metric type | Table | Status |
+|---|---|---|
+| Histogram | `otel_metrics_histogram` | Schema only — no insert logic |
+| Exponential Histogram | `otel_metrics_exponential_histogram` | Schema only — no insert logic |
+| Summary | `otel_metrics_summary` | Schema only — no insert logic |
+
+To add support for a missing type, implement the corresponding mapping in [metrics_mapper.go](metrics_mapper.go) and the batch insert in [clickhouse_store.go](clickhouse_store.go), following the existing Gauge/Sum pattern.
+
+---
+
 ## Future Improvements
 
 ### TLS support for gRPC transport
