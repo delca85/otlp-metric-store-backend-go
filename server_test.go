@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	otelmetrics "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/grpc"
@@ -47,18 +49,14 @@ func TestMetricsServiceServer_Export(t *testing.T) {
 	for scenario, tt := range tests {
 		t.Run(scenario, func(t *testing.T) {
 			out, err := client.Export(ctx, tt.in)
-			if err != nil {
-				if tt.expected.err == nil || tt.expected.err.Error() != err.Error() {
-					t.Errorf("Err -> \nWant: %q\nGot: %q\n", tt.expected.err, err)
-				}
+			if tt.expected.err != nil {
+				require.EqualError(t, err, tt.expected.err.Error())
 			} else {
-				expectedPartialSuccess := tt.expected.out.GetPartialSuccess()
-				if expectedPartialSuccess.GetRejectedDataPoints() != out.GetPartialSuccess().GetRejectedDataPoints() ||
-					expectedPartialSuccess.GetErrorMessage() != out.GetPartialSuccess().GetErrorMessage() {
-					t.Errorf("Out -> \nWant: %q\nGot : %q", tt.expected.out, out)
-				}
+				require.NoError(t, err)
+				expectedPS := tt.expected.out.GetPartialSuccess()
+				assert.Equal(t, expectedPS.GetRejectedDataPoints(), out.GetPartialSuccess().GetRejectedDataPoints())
+				assert.Equal(t, expectedPS.GetErrorMessage(), out.GetPartialSuccess().GetErrorMessage())
 			}
-
 		})
 	}
 }

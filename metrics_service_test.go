@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
@@ -126,30 +128,14 @@ func TestExport_GaugeMetric_CallsInsertGauge(t *testing.T) {
 
 	resp, err := srv.Export(context.Background(), exportGaugeRequest("my-svc", "cpu.usage", 55.5))
 
-	if err != nil {
-		t.Fatalf("Export returned unexpected error: %v", err)
-	}
-	if resp == nil {
-		t.Fatal("Export returned nil response")
-	}
-	if store.insertGaugeCalls != 1 {
-		t.Errorf("expected InsertGauge called once, got %d", store.insertGaugeCalls)
-	}
-	if store.insertSumCalls != 0 {
-		t.Errorf("expected InsertSum not called, got %d calls", store.insertSumCalls)
-	}
-	if len(store.gaugeRows) != 1 {
-		t.Fatalf("expected 1 gauge row forwarded to store, got %d", len(store.gaugeRows))
-	}
-	if store.gaugeRows[0].Value != 55.5 {
-		t.Errorf("gauge row Value: got %f, want 55.5", store.gaugeRows[0].Value)
-	}
-	if len(store.gaugeMetadata) != 1 {
-		t.Errorf("expected 1 metadata row forwarded to store, got %d", len(store.gaugeMetadata))
-	}
-	if store.gaugeMetadata[0].ServiceName != "my-svc" {
-		t.Errorf("metadata ServiceName: got %q, want %q", store.gaugeMetadata[0].ServiceName, "my-svc")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, 1, store.insertGaugeCalls, "expected InsertGauge called once")
+	assert.Equal(t, 0, store.insertSumCalls, "expected InsertSum not called")
+	require.Len(t, store.gaugeRows, 1, "expected 1 gauge row forwarded to store")
+	assert.Equal(t, 55.5, store.gaugeRows[0].Value)
+	require.Len(t, store.gaugeMetadata, 1, "expected 1 metadata row forwarded to store")
+	assert.Equal(t, "my-svc", store.gaugeMetadata[0].ServiceName)
 }
 
 func TestExport_SumMetric_CallsInsertSum(t *testing.T) {
@@ -158,21 +144,11 @@ func TestExport_SumMetric_CallsInsertSum(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), exportSumRequest("my-svc", "requests.total", 100))
 
-	if err != nil {
-		t.Fatalf("Export returned unexpected error: %v", err)
-	}
-	if store.insertSumCalls != 1 {
-		t.Errorf("expected InsertSum called once, got %d", store.insertSumCalls)
-	}
-	if store.insertGaugeCalls != 0 {
-		t.Errorf("expected InsertGauge not called, got %d calls", store.insertGaugeCalls)
-	}
-	if len(store.sumRows) != 1 {
-		t.Fatalf("expected 1 sum row forwarded to store, got %d", len(store.sumRows))
-	}
-	if store.sumRows[0].Value != 100 {
-		t.Errorf("sum row Value: got %f, want 100", store.sumRows[0].Value)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.insertSumCalls, "expected InsertSum called once")
+	assert.Equal(t, 0, store.insertGaugeCalls, "expected InsertGauge not called")
+	require.Len(t, store.sumRows, 1, "expected 1 sum row forwarded to store")
+	assert.Equal(t, float64(100), store.sumRows[0].Value)
 }
 
 func TestExport_EmptyRequest_NoInsertCalls(t *testing.T) {
@@ -181,13 +157,9 @@ func TestExport_EmptyRequest_NoInsertCalls(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), &colmetricspb.ExportMetricsServiceRequest{})
 
-	if err != nil {
-		t.Fatalf("Export returned unexpected error: %v", err)
-	}
-	if store.insertGaugeCalls != 0 || store.insertSumCalls != 0 {
-		t.Errorf("expected no insert calls for empty request, got gauge=%d sum=%d",
-			store.insertGaugeCalls, store.insertSumCalls)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, 0, store.insertGaugeCalls, "expected no gauge insert calls for empty request")
+	assert.Equal(t, 0, store.insertSumCalls, "expected no sum insert calls for empty request")
 }
 
 func TestExport_NilStore_DoesNotPanic(t *testing.T) {
@@ -196,12 +168,8 @@ func TestExport_NilStore_DoesNotPanic(t *testing.T) {
 
 	resp, err := srv.Export(context.Background(), exportGaugeRequest("svc", "m", 1.0))
 
-	if err != nil {
-		t.Fatalf("Export with nil store returned error: %v", err)
-	}
-	if resp == nil {
-		t.Error("Export with nil store returned nil response")
-	}
+	require.NoError(t, err)
+	assert.NotNil(t, resp)
 }
 
 func TestExport_InsertGaugeError_ReturnsError(t *testing.T) {
@@ -210,12 +178,8 @@ func TestExport_InsertGaugeError_ReturnsError(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), exportGaugeRequest("svc", "m", 1.0))
 
-	if err == nil {
-		t.Fatal("expected error from Export when InsertGauge fails, got nil")
-	}
-	if status.Code(err) != grpccodes.Internal {
-		t.Errorf("expected gRPC Internal status, got %v", err)
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.Internal, status.Code(err))
 }
 
 func TestExport_InsertSumError_ReturnsError(t *testing.T) {
@@ -224,12 +188,8 @@ func TestExport_InsertSumError_ReturnsError(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), exportSumRequest("svc", "m", 1.0))
 
-	if err == nil {
-		t.Fatal("expected error from Export when InsertSum fails, got nil")
-	}
-	if status.Code(err) != grpccodes.Internal {
-		t.Errorf("expected gRPC Internal status, got %v", err)
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.Internal, status.Code(err))
 }
 
 func TestExport_EmptyMetricName_ReturnsInvalidArgument(t *testing.T) {
@@ -238,15 +198,9 @@ func TestExport_EmptyMetricName_ReturnsInvalidArgument(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), exportGaugeRequest("svc", "", 1.0))
 
-	if err == nil {
-		t.Fatal("expected error for empty metric name, got nil")
-	}
-	if status.Code(err) != grpccodes.InvalidArgument {
-		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
-	}
-	if store.insertGaugeCalls != 0 {
-		t.Error("InsertGauge must not be called when validation fails")
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.InvalidArgument, status.Code(err))
+	assert.Equal(t, 0, store.insertGaugeCalls, "InsertGauge must not be called when validation fails")
 }
 
 func TestExport_EmptyMetricNameInBatch_ReturnsInvalidArgument(t *testing.T) {
@@ -276,15 +230,9 @@ func TestExport_EmptyMetricNameInBatch_ReturnsInvalidArgument(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), req)
 
-	if err == nil {
-		t.Fatal("expected error for empty metric name in batch, got nil")
-	}
-	if status.Code(err) != grpccodes.InvalidArgument {
-		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
-	}
-	if store.insertGaugeCalls != 0 {
-		t.Error("InsertGauge must not be called when validation fails")
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.InvalidArgument, status.Code(err))
+	assert.Equal(t, 0, store.insertGaugeCalls, "InsertGauge must not be called when validation fails")
 }
 
 func TestExport_GaugeZeroTimeUnixNano_ReturnsInvalidArgument(t *testing.T) {
@@ -307,15 +255,9 @@ func TestExport_GaugeZeroTimeUnixNano_ReturnsInvalidArgument(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), req)
 
-	if err == nil {
-		t.Fatal("expected error for gauge data point with time_unix_nano=0, got nil")
-	}
-	if status.Code(err) != grpccodes.InvalidArgument {
-		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
-	}
-	if store.insertGaugeCalls != 0 {
-		t.Error("InsertGauge must not be called when validation fails")
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.InvalidArgument, status.Code(err))
+	assert.Equal(t, 0, store.insertGaugeCalls, "InsertGauge must not be called when validation fails")
 }
 
 func TestExport_SumZeroTimeUnixNano_ReturnsInvalidArgument(t *testing.T) {
@@ -339,15 +281,9 @@ func TestExport_SumZeroTimeUnixNano_ReturnsInvalidArgument(t *testing.T) {
 
 	_, err := srv.Export(context.Background(), req)
 
-	if err == nil {
-		t.Fatal("expected error for sum data point with time_unix_nano=0, got nil")
-	}
-	if status.Code(err) != grpccodes.InvalidArgument {
-		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
-	}
-	if store.insertSumCalls != 0 {
-		t.Error("InsertSum must not be called when validation fails")
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.InvalidArgument, status.Code(err))
+	assert.Equal(t, 0, store.insertSumCalls, "InsertSum must not be called when validation fails")
 }
 
 func TestExport_SumUnspecifiedAggregationTemporality_ReturnsInvalidArgument(t *testing.T) {
@@ -372,15 +308,9 @@ func TestExport_SumUnspecifiedAggregationTemporality_ReturnsInvalidArgument(t *t
 
 	_, err := srv.Export(context.Background(), req)
 
-	if err == nil {
-		t.Fatal("expected error for sum with UNSPECIFIED aggregation_temporality, got nil")
-	}
-	if status.Code(err) != grpccodes.InvalidArgument {
-		t.Errorf("expected gRPC InvalidArgument, got %v", status.Code(err))
-	}
-	if store.insertSumCalls != 0 {
-		t.Error("InsertSum must not be called when validation fails")
-	}
+	require.Error(t, err)
+	assert.Equal(t, grpccodes.InvalidArgument, status.Code(err))
+	assert.Equal(t, 0, store.insertSumCalls, "InsertSum must not be called when validation fails")
 }
 
 func TestExport_SumDeltaTemporality_Accepted(t *testing.T) {
@@ -388,10 +318,7 @@ func TestExport_SumDeltaTemporality_Accepted(t *testing.T) {
 	srv := newServer("test", store)
 
 	_, err := srv.Export(context.Background(), exportSumRequest("svc", "requests.total", 1.0))
-
-	if err != nil {
-		t.Fatalf("expected valid sum (CUMULATIVE) to be accepted, got: %v", err)
-	}
+	require.NoError(t, err, "expected valid sum (CUMULATIVE) to be accepted")
 
 	now := uint64(time.Now().UnixNano())
 	deltaReq := &colmetricspb.ExportMetricsServiceRequest{
@@ -409,9 +336,7 @@ func TestExport_SumDeltaTemporality_Accepted(t *testing.T) {
 		},
 	}
 	_, err = srv.Export(context.Background(), deltaReq)
-	if err != nil {
-		t.Fatalf("expected valid sum (DELTA) to be accepted, got: %v", err)
-	}
+	require.NoError(t, err, "expected valid sum (DELTA) to be accepted")
 }
 
 func TestExport_MetadataHashMatchesDatapointHash(t *testing.T) {
@@ -419,12 +344,8 @@ func TestExport_MetadataHashMatchesDatapointHash(t *testing.T) {
 	srv := newServer("test", store)
 
 	_, err := srv.Export(context.Background(), exportGaugeRequest("svc", "cpu.usage", 1.0))
-	if err != nil {
-		t.Fatalf("Export error: %v", err)
-	}
+	require.NoError(t, err)
 
-	if store.gaugeRows[0].MetricHash != store.gaugeMetadata[0].MetricHash {
-		t.Errorf("GaugeRow.MetricHash %d != MetadataRow.MetricHash %d — join key mismatch",
-			store.gaugeRows[0].MetricHash, store.gaugeMetadata[0].MetricHash)
-	}
+	assert.Equal(t, store.gaugeRows[0].MetricHash, store.gaugeMetadata[0].MetricHash,
+		"GaugeRow.MetricHash must match MetadataRow.MetricHash — join key mismatch")
 }

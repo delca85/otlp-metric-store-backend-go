@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -37,24 +39,17 @@ func setupClickHouse(t *testing.T) (*ClickHouseMetricsStore, func()) {
 			wait.ForListeningPort("9000/tcp").WithStartupTimeout(60*time.Second),
 		),
 	)
-	if err != nil {
-		t.Fatalf("starting clickhouse container: %v", err)
-	}
+	require.NoError(t, err, "starting clickhouse container")
 
 	host, err := ctr.Host(ctx)
-	if err != nil {
-		t.Fatalf("getting container host: %v", err)
-	}
+	require.NoError(t, err, "getting container host")
+
 	mappedPort, err := ctr.MappedPort(ctx, "9000/tcp")
-	if err != nil {
-		t.Fatalf("getting mapped port: %v", err)
-	}
+	require.NoError(t, err, "getting mapped port")
 
 	addr := fmt.Sprintf("%s:%s", host, mappedPort.Port())
 	store, err := NewClickHouseMetricsStore(ctx, addr, "default", "default", "test")
-	if err != nil {
-		t.Fatalf("creating clickhouse metrics store: %v", err)
-	}
+	require.NoError(t, err, "creating clickhouse metrics store")
 
 	cleanup := func() {
 		store.Close()
@@ -71,9 +66,7 @@ func TestCreateTables(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	expectedTables := []string{
 		"otel_metrics_metadata",
@@ -89,12 +82,8 @@ func TestCreateTables(t *testing.T) {
 		err := store.conn.QueryRow(ctx,
 			"SELECT count() FROM system.tables WHERE database = 'default' AND name = $1", table,
 		).Scan(&count)
-		if err != nil {
-			t.Fatalf("querying system.tables for %s: %v", table, err)
-		}
-		if count != 1 {
-			t.Errorf("expected table %s to exist, got count=%d", table, count)
-		}
+		require.NoErrorf(t, err, "querying system.tables for %s", table)
+		assert.Equalf(t, uint64(1), count, "expected table %s to exist", table)
 	}
 }
 
@@ -107,9 +96,7 @@ func TestInsertMetadata_AnyLastSemantics(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	now := uint64(time.Now().UnixNano())
 
@@ -144,17 +131,12 @@ func TestInsertMetadata_AnyLastSemantics(t *testing.T) {
 	}
 
 	rows1, metadata1 := MapGaugeRows(makeRM("v1 description"))
-	if err := store.InsertGauge(ctx, rows1, metadata1); err != nil {
-		t.Fatalf("first insert: %v", err)
-	}
+	require.NoError(t, store.InsertGauge(ctx, rows1, metadata1), "first insert")
 
 	rows2, metadata2 := MapGaugeRows(makeRM("v2 description"))
-	if rows1[0].MetricHash != rows2[0].MetricHash {
-		t.Fatalf("expected same MetricHash for same identity, got %d vs %d", rows1[0].MetricHash, rows2[0].MetricHash)
-	}
-	if err := store.InsertGauge(ctx, rows2, metadata2); err != nil {
-		t.Fatalf("second insert: %v", err)
-	}
+	require.Equal(t, rows1[0].MetricHash, rows2[0].MetricHash,
+		"expected same MetricHash for same identity")
+	require.NoError(t, store.InsertGauge(ctx, rows2, metadata2), "second insert")
 
 	// FINAL forces merge; anyLast should retain the most recently inserted MetricDescription.
 	var desc string
@@ -162,12 +144,8 @@ func TestInsertMetadata_AnyLastSemantics(t *testing.T) {
 		"SELECT MetricDescription FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		rows1[0].MetricHash,
 	).Scan(&desc)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if desc != "v2 description" {
-		t.Errorf("expected anyLast to keep 'v2 description', got %q", desc)
-	}
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Equal(t, "v2 description", desc, "expected anyLast to keep 'v2 description'")
 }
 
 // TestInsertMetadata verifies that inserting the same metadata twice results in exactly one
@@ -178,9 +156,7 @@ func TestInsertMetadata(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	now := uint64(time.Now().UnixNano())
 	resourceMetrics := []*metricspb.ResourceMetrics{
@@ -215,24 +191,16 @@ func TestInsertMetadata(t *testing.T) {
 
 	// Insert the same metric twice — same hash, same metadata.
 	rows, metadata := MapGaugeRows(resourceMetrics)
-	if err := store.InsertGauge(ctx, rows, metadata); err != nil {
-		t.Fatalf("first InsertGauge: %v", err)
-	}
-	if err := store.InsertGauge(ctx, rows, metadata); err != nil {
-		t.Fatalf("second InsertGauge: %v", err)
-	}
+	require.NoError(t, store.InsertGauge(ctx, rows, metadata), "first InsertGauge")
+	require.NoError(t, store.InsertGauge(ctx, rows, metadata), "second InsertGauge")
 
 	// FINAL forces merge: duplicate (TimeUnix, MetricName, MetricHash) rows are collapsed.
 	var count uint64
 	err := store.conn.QueryRow(ctx,
 		"SELECT count() FROM otel_metrics_metadata FINAL WHERE MetricName = 'idempotency.gauge'",
 	).Scan(&count)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("expected exactly 1 metadata row after two identical inserts, got %d", count)
-	}
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Equal(t, uint64(1), count, "expected exactly 1 metadata row after two identical inserts")
 }
 
 func TestGRPCToClickHouseSum(t *testing.T) {
@@ -240,9 +208,7 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -282,17 +248,13 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 
 	// Pre-compute expected MetricHash before sending so we can query deterministically.
 	expectedSumRows, _ := MapSumRows(sumResourceMetrics)
-	if len(expectedSumRows) == 0 {
-		t.Fatal("expected at least one sum row from MapSumRows")
-	}
+	require.NotEmpty(t, expectedSumRows, "expected at least one sum row from MapSumRows")
 	expectedSumHash := expectedSumRows[0].GaugeRow.MetricHash
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: sumResourceMetrics,
 	})
-	if err != nil {
-		t.Fatalf("exporting sum metric via grpc: %v", err)
-	}
+	require.NoError(t, err, "exporting sum metric via grpc")
 
 	// Verify the datapoint landed in otel_metrics_sum.
 	var (
@@ -304,15 +266,9 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 		"SELECT MetricHash, Value, IsMonotonic FROM otel_metrics_sum WHERE MetricHash = $1",
 		expectedSumHash,
 	).Scan(&metricHash, &value, &isMonotonic)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_sum: %v", err)
-	}
-	if value != 42.0 {
-		t.Errorf("expected Value=42.0, got %f", value)
-	}
-	if !isMonotonic {
-		t.Errorf("expected IsMonotonic=true")
-	}
+	require.NoError(t, err, "querying otel_metrics_sum")
+	assert.Equal(t, 42.0, value)
+	assert.True(t, isMonotonic)
 
 	// Verify the metadata is resolvable via the MetricHash.
 	var metaSvcName string
@@ -320,12 +276,8 @@ func TestGRPCToClickHouseSum(t *testing.T) {
 		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		metricHash,
 	).Scan(&metaSvcName)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if metaSvcName != "e2e-sum-service" {
-		t.Errorf("expected ServiceName=e2e-sum-service, got %s", metaSvcName)
-	}
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Equal(t, "e2e-sum-service", metaSvcName)
 }
 
 // TestGRPCMixedBatch sends a single Export request containing both a Gauge and a Sum metric,
@@ -336,9 +288,7 @@ func TestGRPCMixedBatch(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -388,64 +338,49 @@ func TestGRPCMixedBatch(t *testing.T) {
 	// Pre-compute hashes so we can query deterministically after the RPC.
 	expectedGaugeRows, _ := MapGaugeRows(mixedResourceMetrics)
 	expectedSumRows, _ := MapSumRows(mixedResourceMetrics)
-	if len(expectedGaugeRows) == 0 || len(expectedSumRows) == 0 {
-		t.Fatal("expected at least one gauge and one sum row from mappers")
-	}
+	require.NotEmpty(t, expectedGaugeRows, "expected at least one gauge row from mappers")
+	require.NotEmpty(t, expectedSumRows, "expected at least one sum row from mappers")
 	gaugeHash := expectedGaugeRows[0].MetricHash
 	sumHash := expectedSumRows[0].GaugeRow.MetricHash
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: mixedResourceMetrics,
 	})
-	if err != nil {
-		t.Fatalf("exporting mixed batch via grpc: %v", err)
-	}
+	require.NoError(t, err, "exporting mixed batch via grpc")
 
 	// Gauge datapoint must be in otel_metrics_gauge.
 	var gaugeValue float64
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT Value FROM otel_metrics_gauge WHERE MetricHash = $1",
 		gaugeHash,
-	).Scan(&gaugeValue); err != nil {
-		t.Fatalf("querying otel_metrics_gauge: %v", err)
-	}
-	if gaugeValue != 55.0 {
-		t.Errorf("expected gauge Value=55.0, got %f", gaugeValue)
-	}
+	).Scan(&gaugeValue)
+	require.NoError(t, err, "querying otel_metrics_gauge")
+	assert.Equal(t, 55.0, gaugeValue)
 
 	// Sum datapoint must be in otel_metrics_sum.
 	var sumValue float64
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT Value FROM otel_metrics_sum WHERE MetricHash = $1",
 		sumHash,
-	).Scan(&sumValue); err != nil {
-		t.Fatalf("querying otel_metrics_sum: %v", err)
-	}
-	if sumValue != 100.0 {
-		t.Errorf("expected sum Value=100.0, got %f", sumValue)
-	}
+	).Scan(&sumValue)
+	require.NoError(t, err, "querying otel_metrics_sum")
+	assert.Equal(t, 100.0, sumValue)
 
 	// Both metadata entries must be resolvable from their respective hashes.
 	var gaugeName, sumName string
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT MetricName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		gaugeHash,
-	).Scan(&gaugeName); err != nil {
-		t.Fatalf("querying metadata for gauge hash: %v", err)
-	}
-	if gaugeName != "mixed.cpu.usage" {
-		t.Errorf("expected MetricName=mixed.cpu.usage, got %s", gaugeName)
-	}
+	).Scan(&gaugeName)
+	require.NoError(t, err, "querying metadata for gauge hash")
+	assert.Equal(t, "mixed.cpu.usage", gaugeName)
 
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT MetricName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		sumHash,
-	).Scan(&sumName); err != nil {
-		t.Fatalf("querying metadata for sum hash: %v", err)
-	}
-	if sumName != "mixed.requests.total" {
-		t.Errorf("expected MetricName=mixed.requests.total, got %s", sumName)
-	}
+	).Scan(&sumName)
+	require.NoError(t, err, "querying metadata for sum hash")
+	assert.Equal(t, "mixed.requests.total", sumName)
 }
 
 // TestResourceAttributeEvolution verifies that when the same metric name is reported from two
@@ -457,9 +392,7 @@ func TestResourceAttributeEvolution(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	makeRM := func(hostname string) []*metricspb.ResourceMetrics {
 		now := uint64(time.Now().UnixNano())
@@ -500,49 +433,34 @@ func TestResourceAttributeEvolution(t *testing.T) {
 
 	hash1 := rows1[0].MetricHash
 	hash2 := rows2[0].MetricHash
-	if hash1 == hash2 {
-		t.Fatalf("expected different MetricHash for different resource attributes, got same hash %d", hash1)
-	}
+	require.NotEqual(t, hash1, hash2, "expected different MetricHash for different resource attributes")
 
-	if err := store.InsertGauge(ctx, rows1, metadata1); err != nil {
-		t.Fatalf("inserting host-1 gauge: %v", err)
-	}
-	if err := store.InsertGauge(ctx, rows2, metadata2); err != nil {
-		t.Fatalf("inserting host-2 gauge: %v", err)
-	}
+	require.NoError(t, store.InsertGauge(ctx, rows1, metadata1), "inserting host-1 gauge")
+	require.NoError(t, store.InsertGauge(ctx, rows2, metadata2), "inserting host-2 gauge")
 
 	// Each host must have its own metadata row — two distinct series in otel_metrics_metadata.
 	var count uint64
-	if err := store.conn.QueryRow(ctx,
+	err := store.conn.QueryRow(ctx,
 		"SELECT count() FROM otel_metrics_metadata FINAL WHERE MetricName = 'evo.cpu.usage'",
-	).Scan(&count); err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if count != 2 {
-		t.Errorf("expected 2 metadata rows for 2 distinct resource attribute sets, got %d", count)
-	}
+	).Scan(&count)
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Equal(t, uint64(2), count, "expected 2 metadata rows for 2 distinct resource attribute sets")
 
 	// Verify each hash resolves to the correct host's resource attributes.
 	var resAttrs1, resAttrs2 map[string]string
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT ResourceAttributes FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		hash1,
-	).Scan(&resAttrs1); err != nil {
-		t.Fatalf("querying metadata for host-1 hash: %v", err)
-	}
-	if resAttrs1["host.name"] != "host-1" {
-		t.Errorf("expected host.name=host-1 in ResourceAttributes, got %v", resAttrs1)
-	}
+	).Scan(&resAttrs1)
+	require.NoError(t, err, "querying metadata for host-1 hash")
+	assert.Equal(t, "host-1", resAttrs1["host.name"])
 
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT ResourceAttributes FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		hash2,
-	).Scan(&resAttrs2); err != nil {
-		t.Fatalf("querying metadata for host-2 hash: %v", err)
-	}
-	if resAttrs2["host.name"] != "host-2" {
-		t.Errorf("expected host.name=host-2 in ResourceAttributes, got %v", resAttrs2)
-	}
+	).Scan(&resAttrs2)
+	require.NoError(t, err, "querying metadata for host-2 hash")
+	assert.Equal(t, "host-2", resAttrs2["host.name"])
 }
 
 // setupGRPCServer starts a bufconn-backed gRPC server wired to store and returns a connected
@@ -563,9 +481,7 @@ func setupGRPCServer(t *testing.T, store MetricsStore) (colmetricspb.MetricsServ
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-	if err != nil {
-		t.Fatalf("connecting to grpc server: %v", err)
-	}
+	require.NoError(t, err, "connecting to grpc server")
 	return colmetricspb.NewMetricsServiceClient(conn), func() {
 		conn.Close()
 		grpcServer.Stop()
@@ -581,9 +497,7 @@ func TestGRPC_NilResource_InsertsWithEmptyServiceName(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -613,25 +527,18 @@ func TestGRPC_NilResource_InsertsWithEmptyServiceName(t *testing.T) {
 	}
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
-	if err != nil {
-		t.Fatalf("Export with nil Resource returned unexpected error: %v", err)
-	}
+	require.NoError(t, err, "Export with nil Resource returned unexpected error")
 
 	expectedRows, _ := MapGaugeRows(rm)
-	if len(expectedRows) == 0 {
-		t.Fatal("expected mapper to produce a gauge row despite nil Resource")
-	}
+	require.NotEmpty(t, expectedRows, "expected mapper to produce a gauge row despite nil Resource")
 	hash := expectedRows[0].MetricHash
 
 	var svcName string
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1", hash,
-	).Scan(&svcName); err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if svcName != "" {
-		t.Errorf("expected ServiceName=\"\" for nil Resource, got %q", svcName)
-	}
+	).Scan(&svcName)
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Empty(t, svcName, "expected ServiceName=\"\" for nil Resource")
 }
 
 // TestGRPC_MissingServiceName_InsertsWithEmptyServiceName verifies that a Resource present but
@@ -642,9 +549,7 @@ func TestGRPC_MissingServiceName_InsertsWithEmptyServiceName(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -679,25 +584,18 @@ func TestGRPC_MissingServiceName_InsertsWithEmptyServiceName(t *testing.T) {
 	}
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
-	if err != nil {
-		t.Fatalf("Export without service.name returned unexpected error: %v", err)
-	}
+	require.NoError(t, err, "Export without service.name returned unexpected error")
 
 	expectedRows, _ := MapGaugeRows(rm)
-	if len(expectedRows) == 0 {
-		t.Fatal("expected mapper to produce a gauge row despite missing service.name")
-	}
+	require.NotEmpty(t, expectedRows, "expected mapper to produce a gauge row despite missing service.name")
 	hash := expectedRows[0].MetricHash
 
 	var svcName string
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1", hash,
-	).Scan(&svcName); err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if svcName != "" {
-		t.Errorf("expected ServiceName=\"\" when service.name attribute is absent, got %q", svcName)
-	}
+	).Scan(&svcName)
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Empty(t, svcName, "expected ServiceName=\"\" when service.name attribute is absent")
 }
 
 // TestGRPC_EmptyMetricName_RejectsWithInvalidArgument verifies that a metric with an empty name
@@ -707,9 +605,7 @@ func TestGRPC_EmptyMetricName_RejectsWithInvalidArgument(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -743,12 +639,8 @@ func TestGRPC_EmptyMetricName_RejectsWithInvalidArgument(t *testing.T) {
 	}
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
-	if err == nil {
-		t.Fatal("expected Export with empty metric name to return an error, got nil")
-	}
-	if code := status.Code(err); code != grpccodes.InvalidArgument {
-		t.Errorf("expected gRPC status InvalidArgument, got %v", code)
-	}
+	require.Error(t, err, "expected Export with empty metric name to return an error")
+	assert.Equal(t, grpccodes.InvalidArgument, status.Code(err))
 }
 
 // TestGRPC_NilDataPointValue_InsertsAsZero verifies that a NumberDataPoint whose Value oneof is
@@ -759,9 +651,7 @@ func TestGRPC_NilDataPointValue_InsertsAsZero(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -795,25 +685,18 @@ func TestGRPC_NilDataPointValue_InsertsAsZero(t *testing.T) {
 	}
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
-	if err != nil {
-		t.Fatalf("Export with nil DataPoint Value returned unexpected error: %v", err)
-	}
+	require.NoError(t, err, "Export with nil DataPoint Value returned unexpected error")
 
 	expectedRows, _ := MapGaugeRows(rm)
-	if len(expectedRows) == 0 {
-		t.Fatal("expected mapper to produce a gauge row despite nil DataPoint Value")
-	}
+	require.NotEmpty(t, expectedRows, "expected mapper to produce a gauge row despite nil DataPoint Value")
 	hash := expectedRows[0].MetricHash
 
 	var value float64
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT Value FROM otel_metrics_gauge WHERE MetricHash = $1", hash,
-	).Scan(&value); err != nil {
-		t.Fatalf("querying otel_metrics_gauge: %v", err)
-	}
-	if value != 0 {
-		t.Errorf("expected Value=0 for nil DataPoint Value oneof, got %f", value)
-	}
+	).Scan(&value)
+	require.NoError(t, err, "querying otel_metrics_gauge")
+	assert.Zero(t, value, "expected Value=0 for nil DataPoint Value oneof")
 }
 
 // TestGRPC_UnimplementedMetricType_SilentlyDropped verifies that sending a Histogram metric — a
@@ -825,9 +708,7 @@ func TestGRPC_UnimplementedMetricType_SilentlyDropped(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -866,25 +747,18 @@ func TestGRPC_UnimplementedMetricType_SilentlyDropped(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatalf("Export with Histogram metric returned unexpected error: %v", err)
-	}
-	if ps := resp.GetPartialSuccess(); ps != nil && ps.GetRejectedDataPoints() > 0 {
-		t.Errorf("expected no rejected data points in PartialSuccess, got %d: %s",
-			ps.GetRejectedDataPoints(), ps.GetErrorMessage())
-	}
+	require.NoError(t, err, "Export with Histogram metric returned unexpected error")
+	assert.Zero(t, resp.GetPartialSuccess().GetRejectedDataPoints(),
+		"expected no rejected data points in PartialSuccess")
 
 	// No rows must appear in any metric or metadata table.
 	for _, table := range []string{"otel_metrics_gauge", "otel_metrics_sum", "otel_metrics_histogram", "otel_metrics_metadata"} {
 		var count uint64
-		if err := store.conn.QueryRow(ctx,
+		err := store.conn.QueryRow(ctx,
 			fmt.Sprintf("SELECT count() FROM %s", table), //nolint:gosec // table name is a hardcoded literal
-		).Scan(&count); err != nil {
-			t.Fatalf("querying %s: %v", table, err)
-		}
-		if count != 0 {
-			t.Errorf("expected 0 rows in %s after Histogram export, got %d", table, count)
-		}
+		).Scan(&count)
+		require.NoErrorf(t, err, "querying %s", table)
+		assert.Zerof(t, count, "expected 0 rows in %s after Histogram export", table)
 	}
 }
 
@@ -896,9 +770,7 @@ func TestGRPC_ValidAndUnimplementedTypeMixed_OnlyValidLands(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -947,48 +819,35 @@ func TestGRPC_ValidAndUnimplementedTypeMixed_OnlyValidLands(t *testing.T) {
 	}
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: rm})
-	if err != nil {
-		t.Fatalf("Export with mixed metric types returned unexpected error: %v", err)
-	}
+	require.NoError(t, err, "Export with mixed metric types returned unexpected error")
 
 	// The gauge datapoint must be present in otel_metrics_gauge.
 	expectedGaugeRows, _ := MapGaugeRows(rm)
-	if len(expectedGaugeRows) == 0 {
-		t.Fatal("expected mapper to produce a gauge row for the Gauge metric")
-	}
+	require.NotEmpty(t, expectedGaugeRows, "expected mapper to produce a gauge row for the Gauge metric")
 	gaugeHash := expectedGaugeRows[0].MetricHash
 
 	var gaugeValue float64
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT Value FROM otel_metrics_gauge WHERE MetricHash = $1", gaugeHash,
-	).Scan(&gaugeValue); err != nil {
-		t.Fatalf("querying otel_metrics_gauge: %v", err)
-	}
-	if gaugeValue != 7.0 {
-		t.Errorf("expected gauge Value=7.0, got %f", gaugeValue)
-	}
+	).Scan(&gaugeValue)
+	require.NoError(t, err, "querying otel_metrics_gauge")
+	assert.Equal(t, 7.0, gaugeValue)
 
 	// The histogram table must remain empty — the datapoint was silently dropped.
 	var histCount uint64
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT count() FROM otel_metrics_histogram",
-	).Scan(&histCount); err != nil {
-		t.Fatalf("querying otel_metrics_histogram: %v", err)
-	}
-	if histCount != 0 {
-		t.Errorf("expected 0 rows in otel_metrics_histogram, got %d", histCount)
-	}
+	).Scan(&histCount)
+	require.NoError(t, err, "querying otel_metrics_histogram")
+	assert.Zero(t, histCount, "expected 0 rows in otel_metrics_histogram")
 
 	// Exactly one metadata row must exist — for the gauge only.
 	var metaCount uint64
-	if err := store.conn.QueryRow(ctx,
+	err = store.conn.QueryRow(ctx,
 		"SELECT count() FROM otel_metrics_metadata FINAL",
-	).Scan(&metaCount); err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if metaCount != 1 {
-		t.Errorf("expected exactly 1 metadata row (gauge only), got %d", metaCount)
-	}
+	).Scan(&metaCount)
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Equal(t, uint64(1), metaCount, "expected exactly 1 metadata row (gauge only)")
 }
 
 func TestGRPCToClickHouse(t *testing.T) {
@@ -996,9 +855,7 @@ func TestGRPCToClickHouse(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
-	if err := store.CreateTables(ctx); err != nil {
-		t.Fatalf("creating tables: %v", err)
-	}
+	require.NoError(t, store.CreateTables(ctx), "creating tables")
 
 	client, grpcCleanup := setupGRPCServer(t, store)
 	defer grpcCleanup()
@@ -1037,17 +894,13 @@ func TestGRPCToClickHouse(t *testing.T) {
 
 	// Pre-compute expected MetricHash before sending so we can query deterministically.
 	expectedGaugeRows, _ := MapGaugeRows(gaugeResourceMetrics)
-	if len(expectedGaugeRows) == 0 {
-		t.Fatal("expected at least one gauge row from MapGaugeRows")
-	}
+	require.NotEmpty(t, expectedGaugeRows, "expected at least one gauge row from MapGaugeRows")
 	expectedGaugeHash := expectedGaugeRows[0].MetricHash
 
 	_, err := client.Export(ctx, &colmetricspb.ExportMetricsServiceRequest{
 		ResourceMetrics: gaugeResourceMetrics,
 	})
-	if err != nil {
-		t.Fatalf("exporting metrics via grpc: %v", err)
-	}
+	require.NoError(t, err, "exporting metrics via grpc")
 
 	// Verify the datapoint landed in otel_metrics_gauge.
 	var (
@@ -1058,12 +911,8 @@ func TestGRPCToClickHouse(t *testing.T) {
 		"SELECT MetricHash, Value FROM otel_metrics_gauge WHERE MetricHash = $1",
 		expectedGaugeHash,
 	).Scan(&metricHash, &value)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_gauge: %v", err)
-	}
-	if value != 99.9 {
-		t.Errorf("expected Value=99.9, got %f", value)
-	}
+	require.NoError(t, err, "querying otel_metrics_gauge")
+	assert.Equal(t, 99.9, value)
 
 	// Verify the metadata is resolvable via the MetricHash.
 	var metaSvcName string
@@ -1071,10 +920,6 @@ func TestGRPCToClickHouse(t *testing.T) {
 		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
 		metricHash,
 	).Scan(&metaSvcName)
-	if err != nil {
-		t.Fatalf("querying otel_metrics_metadata: %v", err)
-	}
-	if metaSvcName != "e2e-service" {
-		t.Errorf("expected ServiceName=e2e-service, got %s", metaSvcName)
-	}
+	require.NoError(t, err, "querying otel_metrics_metadata")
+	assert.Equal(t, "e2e-service", metaSvcName)
 }

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -28,9 +30,7 @@ func TestAnyValueToString_Types(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := anyValueToString(c.v)
-			if got != c.want {
-				t.Errorf("anyValueToString: got %q, want %q", got, c.want)
-			}
+			assert.Equal(t, c.want, got)
 		})
 	}
 }
@@ -39,9 +39,7 @@ func TestAnyValueToString_UnknownType_DoesNotPanic(t *testing.T) {
 	// BytesValue falls through to the default branch; we only assert no panic and non-empty output.
 	v := &commonpb.AnyValue{Value: &commonpb.AnyValue_BytesValue{BytesValue: []byte("raw")}}
 	got := anyValueToString(v)
-	if got == "" {
-		t.Error("expected non-empty fallback string for unknown AnyValue type, got empty")
-	}
+	assert.NotEmpty(t, got, "expected non-empty fallback string for unknown AnyValue type")
 }
 
 // --- serviceName ---
@@ -74,9 +72,7 @@ func TestServiceName_EdgeCases(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := serviceName(c.resource)
-			if got != c.want {
-				t.Errorf("serviceName: got %q, want %q", got, c.want)
-			}
+			assert.Equal(t, c.want, got)
 		})
 	}
 }
@@ -87,9 +83,7 @@ func TestComputeMetricHash_Deterministic(t *testing.T) {
 	attrs := map[string]string{"env": "prod", "region": "us-east-1"}
 	h1 := computeMetricHash("cpu.usage", "my-service", attrs, nil, nil)
 	h2 := computeMetricHash("cpu.usage", "my-service", attrs, nil, nil)
-	if h1 != h2 {
-		t.Errorf("same inputs produced different hashes: %d vs %d", h1, h2)
-	}
+	assert.Equal(t, h1, h2)
 }
 
 func TestComputeMetricHash_MapKeyOrderNormalized(t *testing.T) {
@@ -99,9 +93,7 @@ func TestComputeMetricHash_MapKeyOrderNormalized(t *testing.T) {
 	m2 := map[string]string{"c": "3", "a": "1", "b": "2"}
 	h1 := computeMetricHash("m", "svc", m1, nil, nil)
 	h2 := computeMetricHash("m", "svc", m2, nil, nil)
-	if h1 != h2 {
-		t.Errorf("identical attribute maps with different key order produced different hashes: %d vs %d", h1, h2)
-	}
+	assert.Equal(t, h1, h2, "identical attribute maps with different key order should produce the same hash")
 }
 
 func TestComputeMetricHash_DistinctInputsDistinctHashes(t *testing.T) {
@@ -121,7 +113,7 @@ func TestComputeMetricHash_DistinctInputsDistinctHashes(t *testing.T) {
 	for _, c := range cases {
 		h := computeMetricHash(c.name, c.svc, c.res, nil, nil)
 		if prev, exists := seen[h]; exists {
-			t.Errorf("hash collision between %q and %q (hash=%d)", prev, c.label, h)
+			assert.Failf(t, "hash collision", "between %q and %q (hash=%d)", prev, c.label, h)
 		}
 		seen[h] = c.label
 	}
@@ -131,9 +123,7 @@ func TestComputeMetricHash_NilMapsProduceStableHash(t *testing.T) {
 	// Nil maps must not panic and must produce the same hash as empty maps.
 	h1 := computeMetricHash("m", "svc", nil, nil, nil)
 	h2 := computeMetricHash("m", "svc", map[string]string{}, map[string]string{}, map[string]string{})
-	if h1 != h2 {
-		t.Errorf("nil and empty maps produced different hashes: %d vs %d", h1, h2)
-	}
+	assert.Equal(t, h1, h2, "nil and empty maps should produce the same hash")
 }
 
 func TestComputeMetricHash_ScopeAndAttrsArePartOfIdentity(t *testing.T) {
@@ -141,15 +131,9 @@ func TestComputeMetricHash_ScopeAndAttrsArePartOfIdentity(t *testing.T) {
 	withScope := computeMetricHash("m", "svc", nil, map[string]string{"scope": "v"}, nil)
 	withAttrs := computeMetricHash("m", "svc", nil, nil, map[string]string{"attr": "v"})
 
-	if base == withScope {
-		t.Error("scope attributes should be part of the hash identity")
-	}
-	if base == withAttrs {
-		t.Error("datapoint attributes should be part of the hash identity")
-	}
-	if withScope == withAttrs {
-		t.Error("scope and datapoint attributes should produce different hashes")
-	}
+	assert.NotEqual(t, base, withScope, "scope attributes should be part of the hash identity")
+	assert.NotEqual(t, base, withAttrs, "datapoint attributes should be part of the hash identity")
+	assert.NotEqual(t, withScope, withAttrs, "scope and datapoint attributes should produce different hashes")
 }
 
 // --- writeMapSorted ---
@@ -158,32 +142,26 @@ func TestWriteMapSorted_ProducesSortedOutput(t *testing.T) {
 	var b strings.Builder
 	writeMapSorted(&b, map[string]string{"z": "3", "a": "1", "m": "2"})
 	parts := strings.Split(b.String(), string(entrySep))
-	if len(parts) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(parts))
-	}
+	require.Len(t, parts, 3, "expected 3 entries")
 	want := []struct{ k, v string }{{"a", "1"}, {"m", "2"}, {"z", "3"}}
 	for i, p := range parts {
 		kv := strings.SplitN(p, string(kvSep), 2)
-		if len(kv) != 2 || kv[0] != want[i].k || kv[1] != want[i].v {
-			t.Errorf("entry %d: got %q, want key=%q value=%q", i, p, want[i].k, want[i].v)
-		}
+		require.Lenf(t, kv, 2, "entry %d: invalid format %q", i, p)
+		assert.Equal(t, want[i].k, kv[0], "entry %d key", i)
+		assert.Equal(t, want[i].v, kv[1], "entry %d value", i)
 	}
 }
 
 func TestWriteMapSorted_EmptyMap(t *testing.T) {
 	var b strings.Builder
 	writeMapSorted(&b, map[string]string{})
-	if b.String() != "" {
-		t.Errorf("empty map should produce empty string, got %q", b.String())
-	}
+	assert.Empty(t, b.String(), "empty map should produce empty string")
 }
 
 func TestWriteMapSorted_NilMap(t *testing.T) {
 	var b strings.Builder
 	writeMapSorted(&b, nil) // must not panic
-	if b.String() != "" {
-		t.Errorf("nil map should produce empty string, got %q", b.String())
-	}
+	assert.Empty(t, b.String(), "nil map should produce empty string")
 }
 
 // --- MapGaugeRows ---
@@ -231,62 +209,30 @@ func TestMapGaugeRows_FieldMapping(t *testing.T) {
 
 	rows, metadata := MapGaugeRows(rm)
 
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 GaugeRow, got %d", len(rows))
-	}
-	if len(metadata) != 1 {
-		t.Fatalf("expected 1 MetadataRow, got %d", len(metadata))
-	}
+	require.Len(t, rows, 1, "expected 1 GaugeRow")
+	require.Len(t, metadata, 1, "expected 1 MetadataRow")
 
 	r := rows[0]
 	m := metadata[0]
 
-	if r.Value != 42.5 {
-		t.Errorf("Value: got %f, want 42.5", r.Value)
-	}
-	if r.Flags != 3 {
-		t.Errorf("Flags: got %d, want 3", r.Flags)
-	}
-	if r.MetricHash == 0 {
-		t.Error("MetricHash must be non-zero")
-	}
-	if r.MetricHash != m.MetricHash {
-		t.Errorf("GaugeRow.MetricHash %d does not match MetadataRow.MetricHash %d", r.MetricHash, m.MetricHash)
-	}
-	if m.MetricName != "cpu.usage" {
-		t.Errorf("MetricName: got %q, want %q", m.MetricName, "cpu.usage")
-	}
-	if m.MetricDescription != "test description" {
-		t.Errorf("MetricDescription: got %q, want %q", m.MetricDescription, "test description")
-	}
-	if m.MetricUnit != "{unit}" {
-		t.Errorf("MetricUnit: got %q, want %q", m.MetricUnit, "{unit}")
-	}
-	if m.MetricType != "Gauge" {
-		t.Errorf("MetricType: got %q, want %q", m.MetricType, "Gauge")
-	}
-	if m.ServiceName != "my-service" {
-		t.Errorf("ServiceName: got %q, want %q", m.ServiceName, "my-service")
-	}
-	if m.ScopeName != "test-scope" {
-		t.Errorf("ScopeName: got %q, want %q", m.ScopeName, "test-scope")
-	}
-	if m.ScopeVersion != "1.0" {
-		t.Errorf("ScopeVersion: got %q, want %q", m.ScopeVersion, "1.0")
-	}
-	if m.Attributes["cpu"] != "0" {
-		t.Errorf("Attributes[cpu]: got %q, want %q", m.Attributes["cpu"], "0")
-	}
+	assert.Equal(t, 42.5, r.Value)
+	assert.Equal(t, uint32(3), r.Flags)
+	assert.NotZero(t, r.MetricHash, "MetricHash must be non-zero")
+	assert.Equal(t, r.MetricHash, m.MetricHash, "GaugeRow.MetricHash must match MetadataRow.MetricHash")
+	assert.Equal(t, "cpu.usage", m.MetricName)
+	assert.Equal(t, "test description", m.MetricDescription)
+	assert.Equal(t, "{unit}", m.MetricUnit)
+	assert.Equal(t, "Gauge", m.MetricType)
+	assert.Equal(t, "my-service", m.ServiceName)
+	assert.Equal(t, "test-scope", m.ScopeName)
+	assert.Equal(t, "1.0", m.ScopeVersion)
+	assert.Equal(t, "0", m.Attributes["cpu"])
 }
 
 func TestMapGaugeRows_EmptyInput(t *testing.T) {
 	rows, metadata := MapGaugeRows(nil)
-	if len(rows) != 0 {
-		t.Errorf("expected 0 rows for nil input, got %d", len(rows))
-	}
-	if len(metadata) != 0 {
-		t.Errorf("expected 0 metadata for nil input, got %d", len(metadata))
-	}
+	assert.Empty(t, rows, "expected 0 rows for nil input")
+	assert.Empty(t, metadata, "expected 0 metadata for nil input")
 }
 
 func TestMapGaugeRows_SkipsNonGaugeMetrics(t *testing.T) {
@@ -318,12 +264,8 @@ func TestMapGaugeRows_SkipsNonGaugeMetrics(t *testing.T) {
 	}
 
 	rows, metadata := MapGaugeRows(rm)
-	if len(rows) != 0 {
-		t.Errorf("expected 0 gauge rows from sum metric input, got %d", len(rows))
-	}
-	if len(metadata) != 0 {
-		t.Errorf("expected 0 metadata rows from sum metric input, got %d", len(metadata))
-	}
+	assert.Empty(t, rows, "expected 0 gauge rows from sum metric input")
+	assert.Empty(t, metadata, "expected 0 metadata rows from sum metric input")
 }
 
 func TestMapGaugeRows_MultipleDataPoints(t *testing.T) {
@@ -357,18 +299,12 @@ func TestMapGaugeRows_MultipleDataPoints(t *testing.T) {
 	}
 
 	rows, metadata := MapGaugeRows(rm)
-	if len(rows) != 3 {
-		t.Errorf("expected 3 GaugeRows, got %d", len(rows))
-	}
-	if len(metadata) != 1 {
-		t.Errorf("expected 1 MetadataRow for 3 datapoints of the same series, got %d", len(metadata))
-	}
+	assert.Len(t, rows, 3, "expected 3 GaugeRows")
+	assert.Len(t, metadata, 1, "expected 1 MetadataRow for 3 datapoints of the same series")
 	// All rows for the same series must share the same MetricHash.
 	hash := rows[0].MetricHash
 	for i, r := range rows {
-		if r.MetricHash != hash {
-			t.Errorf("row[%d].MetricHash %d differs from row[0].MetricHash %d", i, r.MetricHash, hash)
-		}
+		assert.Equalf(t, hash, r.MetricHash, "row[%d].MetricHash differs from row[0].MetricHash", i)
 	}
 }
 
@@ -410,31 +346,17 @@ func TestMapSumRows_FieldMapping(t *testing.T) {
 
 	rows, metadata := MapSumRows(rm)
 
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 SumRow, got %d", len(rows))
-	}
-	if len(metadata) != 1 {
-		t.Fatalf("expected 1 MetadataRow, got %d", len(metadata))
-	}
+	require.Len(t, rows, 1, "expected 1 SumRow")
+	require.Len(t, metadata, 1, "expected 1 MetadataRow")
 
 	r := rows[0]
 	m := metadata[0]
 
-	if r.Value != 100 {
-		t.Errorf("Value: got %f, want 100", r.Value)
-	}
-	if r.AggregationTemporality != int32(metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE) {
-		t.Errorf("AggregationTemporality: got %d, want %d", r.AggregationTemporality, metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE)
-	}
-	if !r.IsMonotonic {
-		t.Error("IsMonotonic: got false, want true")
-	}
-	if m.MetricType != "Sum" {
-		t.Errorf("MetricType: got %q, want %q", m.MetricType, "Sum")
-	}
-	if r.MetricHash != m.MetricHash {
-		t.Errorf("SumRow.MetricHash %d does not match MetadataRow.MetricHash %d", r.MetricHash, m.MetricHash)
-	}
+	assert.Equal(t, float64(100), r.Value)
+	assert.Equal(t, int32(metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE), r.AggregationTemporality)
+	assert.True(t, r.IsMonotonic, "IsMonotonic should be true")
+	assert.Equal(t, "Sum", m.MetricType)
+	assert.Equal(t, r.MetricHash, m.MetricHash, "SumRow.MetricHash must match MetadataRow.MetricHash")
 }
 
 func TestMapSumRows_SkipsNonSumMetrics(t *testing.T) {
@@ -442,12 +364,8 @@ func TestMapSumRows_SkipsNonSumMetrics(t *testing.T) {
 	rm := gaugeResourceMetrics("svc", "cpu.usage", 1.0, now)
 
 	rows, metadata := MapSumRows(rm)
-	if len(rows) != 0 {
-		t.Errorf("expected 0 sum rows from gauge metric input, got %d", len(rows))
-	}
-	if len(metadata) != 0 {
-		t.Errorf("expected 0 metadata rows from gauge metric input, got %d", len(metadata))
-	}
+	assert.Empty(t, rows, "expected 0 sum rows from gauge metric input")
+	assert.Empty(t, metadata, "expected 0 metadata rows from gauge metric input")
 }
 
 // TestMapGaugeRows_HashConsistency verifies that the hash is purely a function of the
@@ -461,10 +379,8 @@ func TestMapGaugeRows_HashIndependentOfValueAndTime(t *testing.T) {
 	rows1, _ := MapGaugeRows(mkRM(1.0, now))
 	rows2, _ := MapGaugeRows(mkRM(999.0, now+1000000000))
 
-	if rows1[0].MetricHash != rows2[0].MetricHash {
-		t.Errorf("hash should be identical for same series regardless of value/time: %d vs %d",
-			rows1[0].MetricHash, rows2[0].MetricHash)
-	}
+	assert.Equal(t, rows1[0].MetricHash, rows2[0].MetricHash,
+		"hash should be identical for same series regardless of value/time")
 }
 
 // TestMapGaugeRows_IntValueDataPoint verifies AsInt datapoints are converted to float64 correctly.
@@ -496,10 +412,6 @@ func TestMapGaugeRows_IntValueDataPoint(t *testing.T) {
 	}
 
 	rows, _ := MapGaugeRows(rm)
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 row, got %d", len(rows))
-	}
-	if rows[0].Value != 42.0 {
-		t.Errorf("AsInt value: got %f, want 42.0", rows[0].Value)
-	}
+	require.Len(t, rows, 1, "expected 1 row")
+	assert.Equal(t, float64(42), rows[0].Value, "AsInt value should be converted to float64")
 }
