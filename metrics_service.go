@@ -73,7 +73,6 @@ func (m *metricsServiceServer) Export(ctx context.Context, request *colmetricspb
 	defer span.End()
 
 	slog.DebugContext(ctx, "Received ExportMetricsServiceRequest")
-	metricsReceivedCounter.Add(ctx, 1)
 
 	rm := request.GetResourceMetrics()
 	if err := validateResourceMetrics(rm); err != nil {
@@ -85,6 +84,7 @@ func (m *metricsServiceServer) Export(ctx context.Context, request *colmetricspb
 
 		gaugeRows, gaugeMetadata := MapGaugeRows(rm)
 		sumRows, sumMetadata := MapSumRows(rm)
+		metricsReceivedCounter.Add(ctx, int64(len(gaugeRows)+len(sumRows)))
 		span.SetAttributes(
 			attribute.Int("metric.gauge.count", len(gaugeRows)),
 			attribute.Int("metric.sum.count", len(sumRows)),
