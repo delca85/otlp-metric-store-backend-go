@@ -129,6 +129,76 @@ go run ./...
 
 ---
 
+## Running locally
+
+This section shows how to spin up a real ClickHouse instance and send test metrics end-to-end — useful for manual exploration and schema inspection.
+
+### 1. Start ClickHouse
+
+```shell
+docker run --rm -d \
+  --name clickhouse-dev \
+  -p 9000:9000 \
+  -p 8123:8123 \
+  -e CLICKHOUSE_USER=default \
+  -e CLICKHOUSE_PASSWORD=test \
+  clickhouse/clickhouse-server:26.2
+```
+
+### 2. Start the server
+
+```shell
+go run ./... \
+  -clickhouse-addr localhost:9000 \
+  -clickhouse-password test
+```
+
+The server creates all tables on startup and is ready to accept OTLP exports on `localhost:4317`.
+
+### 3. Send a test metric
+
+```shell
+go run tools/send-test-metric/main.go
+# or point at a non-default address:
+go run tools/send-test-metric/main.go -addr localhost:4317
+```
+
+This sends one gauge (`cpu.utilization`) and one sum (`requests.total`) from a fictional `my-test-service`.
+
+### 4. Inspect the data
+
+```shell
+docker exec -it clickhouse-dev clickhouse-client --password test
+```
+
+```sql
+-- Metric series registered
+SELECT MetricName, ServiceName, MetricType, Attributes
+FROM otel_metrics_metadata FINAL;
+
+-- Gauge datapoints
+SELECT TimeUnix, MetricName, ServiceName, Value
+FROM otel_metrics_gauge AS g
+LEFT ANY JOIN otel_metrics_metadata FINAL AS m ON g.MetricHash = m.MetricHash
+ORDER BY TimeUnix DESC
+LIMIT 20;
+
+-- Sum datapoints
+SELECT TimeUnix, MetricName, ServiceName, Value
+FROM otel_metrics_sum AS s
+LEFT ANY JOIN otel_metrics_metadata FINAL AS m ON s.MetricHash = m.MetricHash
+ORDER BY TimeUnix DESC
+LIMIT 20;
+```
+
+### 5. Stop ClickHouse
+
+```shell
+docker stop clickhouse-dev
+```
+
+---
+
 ## Tests
 
 ### Unit tests
