@@ -28,9 +28,9 @@ OTLP sender (e.g. OTel Collector)
            │
     ┌──────┴──────┐
     ▼             ▼
-otel_metrics_   otel_metrics_gauge
-metadata        otel_metrics_sum
-(AggMergeTree)  otel_metrics_histogram …
+otel_metrics_      otel_metrics_gauge
+metadata           otel_metrics_sum
+(ReplacingMerge)   otel_metrics_histogram …
 ```
 
 ### Schema design
@@ -106,7 +106,7 @@ go run ./...
   -clickhouse-password secret
 ```
 
-> The service drops and recreates all tables on startup to guarantee schema consistency. Do not run against a ClickHouse instance with data you need to preserve unless you update this behaviour in `clickhouse_client.go`.
+> Tables are created with `CREATE TABLE IF NOT EXISTS` on startup — existing data is preserved across restarts.
 
 ---
 
