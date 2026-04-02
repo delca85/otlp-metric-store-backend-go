@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
@@ -67,14 +70,55 @@ func numberDataPointValue(dp *metricspb.NumberDataPoint) float64 {
 	}
 }
 
-// MapGaugeRows converts an ExportMetricsServiceRequest into GaugeRows
-// for all Gauge metrics found in the request.
-func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) []GaugeRow {
+// computeMetricHash returns xxHash64 of the canonical series identity string:
+//
+//	MetricName|ServiceName|sorted(ResourceAttributes)|sorted(ScopeAttributes)|sorted(Attributes)
+//
+// Maps are serialized as key=value,key=value,... with keys sorted ascending so that
+// the same attribute set always produces the same hash regardless of Go map iteration order.
+// MetricType is intentionally excluded — it is a property of the series, not part of its identity.
+func computeMetricHash(metricName, svcName string, resourceAttrs, scopeAttrs, attrs map[string]string) uint64 {
+	var b strings.Builder
+	b.WriteString(metricName)
+	b.WriteByte('|')
+	b.WriteString(svcName)
+	b.WriteByte('|')
+	writeMapSorted(&b, resourceAttrs)
+	b.WriteByte('|')
+	writeMapSorted(&b, scopeAttrs)
+	b.WriteByte('|')
+	writeMapSorted(&b, attrs)
+	return xxhash.Sum64String(b.String())
+}
+
+// writeMapSorted writes map entries to b as key=value,key=value,... with keys sorted ascending.
+func writeMapSorted(b *strings.Builder, m map[string]string) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(m[k])
+	}
+}
+
+// MapGaugeRows converts ResourceMetrics into slim GaugeRows and their corresponding MetadataRows.
+// One MetadataRow is emitted per unique MetricHash — duplicate hashes within the batch are
+// collapsed here so the caller receives a pre-deduplicated metadata slice.
+func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) ([]GaugeRow, []MetadataRow) {
 	var rows []GaugeRow
+	var metadata []MetadataRow
+	seenHashes := make(map[uint64]struct{})
+
 	for _, rm := range resourceMetrics {
 		svcName := serviceName(rm.GetResource())
 		resAttrs := kvToMap(rm.GetResource().GetAttributes())
-		resSchemaUrl := rm.GetSchemaUrl()
 
 		for _, sm := range rm.GetScopeMetrics() {
 			scope := sm.GetScope()
@@ -86,39 +130,52 @@ func MapGaugeRows(resourceMetrics []*metricspb.ResourceMetrics) []GaugeRow {
 					continue
 				}
 				for _, dp := range gauge.GetDataPoints() {
+					attrs := kvToMap(dp.GetAttributes())
+					hash := computeMetricHash(metric.GetName(), svcName, resAttrs, scopeAttrs, attrs)
+					t := nanosToTime(dp.GetTimeUnixNano())
+
 					rows = append(rows, GaugeRow{
-						ResourceAttributes:    resAttrs,
-						ResourceSchemaUrl:     resSchemaUrl,
-						ScopeName:             scope.GetName(),
-						ScopeVersion:          scope.GetVersion(),
-						ScopeAttributes:       scopeAttrs,
-						ScopeDroppedAttrCount: scope.GetDroppedAttributesCount(),
-						ScopeSchemaUrl:        sm.GetSchemaUrl(),
-						ServiceName:           svcName,
-						MetricName:            metric.GetName(),
-						MetricDescription:     metric.GetDescription(),
-						MetricUnit:            metric.GetUnit(),
-						Attributes:            kvToMap(dp.GetAttributes()),
-						StartTimeUnix:         nanosToTime(dp.GetStartTimeUnixNano()),
-						TimeUnix:              nanosToTime(dp.GetTimeUnixNano()),
-						Value:                 numberDataPointValue(dp),
-						Flags:                 dp.GetFlags(),
+						MetricHash:    hash,
+						StartTimeUnix: nanosToTime(dp.GetStartTimeUnixNano()),
+						TimeUnix:      t,
+						Value:         numberDataPointValue(dp),
+						Flags:         dp.GetFlags(),
 					})
+					if _, seen := seenHashes[hash]; !seen {
+						seenHashes[hash] = struct{}{}
+						metadata = append(metadata, MetadataRow{
+							TimeUnix:           t,
+							MetricHash:         hash,
+							MetricName:         metric.GetName(),
+							MetricDescription:  metric.GetDescription(),
+							MetricUnit:         metric.GetUnit(),
+							MetricType:         "Gauge",
+							ServiceName:        svcName,
+							ResourceAttributes: resAttrs,
+							ScopeAttributes:    scopeAttrs,
+							Attributes:         attrs,
+							ScopeName:          scope.GetName(),
+							ScopeVersion:       scope.GetVersion(),
+						})
+					}
 				}
 			}
 		}
 	}
-	return rows
+	return rows, metadata
 }
 
-// MapSumRows converts an ExportMetricsServiceRequest into SumRows
-// for all Sum metrics found in the request.
-func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) []SumRow {
+// MapSumRows converts ResourceMetrics into slim SumRows and their corresponding MetadataRows.
+// One MetadataRow is emitted per unique MetricHash — duplicate hashes within the batch are
+// collapsed here so the caller receives a pre-deduplicated metadata slice.
+func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) ([]SumRow, []MetadataRow) {
 	var rows []SumRow
+	var metadata []MetadataRow
+	seenHashes := make(map[uint64]struct{})
+
 	for _, rm := range resourceMetrics {
 		svcName := serviceName(rm.GetResource())
 		resAttrs := kvToMap(rm.GetResource().GetAttributes())
-		resSchemaUrl := rm.GetSchemaUrl()
 
 		for _, sm := range rm.GetScopeMetrics() {
 			scope := sm.GetScope()
@@ -130,31 +187,41 @@ func MapSumRows(resourceMetrics []*metricspb.ResourceMetrics) []SumRow {
 					continue
 				}
 				for _, dp := range sum.GetDataPoints() {
+					attrs := kvToMap(dp.GetAttributes())
+					hash := computeMetricHash(metric.GetName(), svcName, resAttrs, scopeAttrs, attrs)
+					t := nanosToTime(dp.GetTimeUnixNano())
+
 					rows = append(rows, SumRow{
 						GaugeRow: GaugeRow{
-							ResourceAttributes:    resAttrs,
-							ResourceSchemaUrl:     resSchemaUrl,
-							ScopeName:             scope.GetName(),
-							ScopeVersion:          scope.GetVersion(),
-							ScopeAttributes:       scopeAttrs,
-							ScopeDroppedAttrCount: scope.GetDroppedAttributesCount(),
-							ScopeSchemaUrl:        sm.GetSchemaUrl(),
-							ServiceName:           svcName,
-							MetricName:            metric.GetName(),
-							MetricDescription:     metric.GetDescription(),
-							MetricUnit:            metric.GetUnit(),
-							Attributes:            kvToMap(dp.GetAttributes()),
-							StartTimeUnix:         nanosToTime(dp.GetStartTimeUnixNano()),
-							TimeUnix:              nanosToTime(dp.GetTimeUnixNano()),
-							Value:                 numberDataPointValue(dp),
-							Flags:                 dp.GetFlags(),
+							MetricHash:    hash,
+							StartTimeUnix: nanosToTime(dp.GetStartTimeUnixNano()),
+							TimeUnix:      t,
+							Value:         numberDataPointValue(dp),
+							Flags:         dp.GetFlags(),
 						},
 						AggregationTemporality: int32(sum.GetAggregationTemporality()),
 						IsMonotonic:            sum.GetIsMonotonic(),
 					})
+					if _, seen := seenHashes[hash]; !seen {
+						seenHashes[hash] = struct{}{}
+						metadata = append(metadata, MetadataRow{
+							TimeUnix:           t,
+							MetricHash:         hash,
+							MetricName:         metric.GetName(),
+							MetricDescription:  metric.GetDescription(),
+							MetricUnit:         metric.GetUnit(),
+							MetricType:         "Sum",
+							ServiceName:        svcName,
+							ResourceAttributes: resAttrs,
+							ScopeAttributes:    scopeAttrs,
+							Attributes:         attrs,
+							ScopeName:          scope.GetName(),
+							ScopeVersion:       scope.GetVersion(),
+						})
+					}
 				}
 			}
 		}
 	}
-	return rows
+	return rows, metadata
 }

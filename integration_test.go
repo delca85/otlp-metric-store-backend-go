@@ -74,6 +74,7 @@ func TestCreateTables(t *testing.T) {
 	}
 
 	expectedTables := []string{
+		"otel_metrics_metadata",
 		"otel_metrics_gauge",
 		"otel_metrics_sum",
 		"otel_metrics_histogram",
@@ -145,31 +146,50 @@ func TestInsertGauge(t *testing.T) {
 		},
 	}
 
-	rows := MapGaugeRows(resourceMetrics)
-	if err := store.InsertGauge(ctx, rows); err != nil {
+	rows, metadata := MapGaugeRows(resourceMetrics)
+	if err := store.InsertGauge(ctx, rows, metadata); err != nil {
 		t.Fatalf("inserting gauge rows: %v", err)
 	}
 
+	// Verify the datapoint row in otel_metrics_gauge.
 	var (
-		serviceName string
-		metricName  string
-		value       float64
+		metricHash uint64
+		value      float64
 	)
 	err := store.conn.QueryRow(ctx,
-		"SELECT ServiceName, MetricName, Value FROM otel_metrics_gauge WHERE MetricName = 'cpu.utilization'",
-	).Scan(&serviceName, &metricName, &value)
+		"SELECT MetricHash, Value FROM otel_metrics_gauge",
+	).Scan(&metricHash, &value)
 	if err != nil {
-		t.Fatalf("querying gauge: %v", err)
-	}
-
-	if serviceName != "test-service" {
-		t.Errorf("expected ServiceName=test-service, got %s", serviceName)
-	}
-	if metricName != "cpu.utilization" {
-		t.Errorf("expected MetricName=cpu.utilization, got %s", metricName)
+		t.Fatalf("querying otel_metrics_gauge: %v", err)
 	}
 	if value != 42.5 {
 		t.Errorf("expected Value=42.5, got %f", value)
+	}
+	if metricHash == 0 {
+		t.Error("expected non-zero MetricHash in otel_metrics_gauge")
+	}
+
+	// Verify the metadata row in otel_metrics_metadata (FINAL forces merge before asserting).
+	var (
+		metaName    string
+		metaSvcName string
+		metaHash    uint64
+	)
+	err = store.conn.QueryRow(ctx,
+		"SELECT MetricName, ServiceName, MetricHash FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		metricHash,
+	).Scan(&metaName, &metaSvcName, &metaHash)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if metaName != "cpu.utilization" {
+		t.Errorf("expected MetricName=cpu.utilization, got %s", metaName)
+	}
+	if metaSvcName != "test-service" {
+		t.Errorf("expected ServiceName=test-service, got %s", metaSvcName)
+	}
+	if metaHash != metricHash {
+		t.Errorf("expected MetricHash to match gauge row, got %d vs %d", metaHash, metricHash)
 	}
 }
 
@@ -228,30 +248,23 @@ func TestInsertSum(t *testing.T) {
 		},
 	}
 
-	rows := MapSumRows(resourceMetrics)
-	if err := store.InsertSum(ctx, rows); err != nil {
+	rows, metadata := MapSumRows(resourceMetrics)
+	if err := store.InsertSum(ctx, rows, metadata); err != nil {
 		t.Fatalf("inserting sum rows: %v", err)
 	}
 
+	// Verify the datapoint row in otel_metrics_sum.
 	var (
-		serviceName            string
-		metricName             string
+		metricHash             uint64
 		value                  float64
 		aggregationTemporality int32
 		isMonotonic            bool
 	)
 	err := store.conn.QueryRow(ctx,
-		"SELECT ServiceName, MetricName, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum WHERE MetricName = 'http.requests.total'",
-	).Scan(&serviceName, &metricName, &value, &aggregationTemporality, &isMonotonic)
+		"SELECT MetricHash, Value, AggregationTemporality, IsMonotonic FROM otel_metrics_sum",
+	).Scan(&metricHash, &value, &aggregationTemporality, &isMonotonic)
 	if err != nil {
-		t.Fatalf("querying sum: %v", err)
-	}
-
-	if serviceName != "test-service" {
-		t.Errorf("expected ServiceName=test-service, got %s", serviceName)
-	}
-	if metricName != "http.requests.total" {
-		t.Errorf("expected MetricName=http.requests.total, got %s", metricName)
+		t.Fatalf("querying otel_metrics_sum: %v", err)
 	}
 	if value != 1234 {
 		t.Errorf("expected Value=1234, got %f", value)
@@ -261,6 +274,90 @@ func TestInsertSum(t *testing.T) {
 	}
 	if !isMonotonic {
 		t.Errorf("expected IsMonotonic=true, got false")
+	}
+
+	// Verify the metadata row in otel_metrics_metadata.
+	var (
+		metaName    string
+		metaSvcName string
+	)
+	err = store.conn.QueryRow(ctx,
+		"SELECT MetricName, ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		metricHash,
+	).Scan(&metaName, &metaSvcName)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if metaName != "http.requests.total" {
+		t.Errorf("expected MetricName=http.requests.total, got %s", metaName)
+	}
+	if metaSvcName != "test-service" {
+		t.Errorf("expected ServiceName=test-service, got %s", metaSvcName)
+	}
+}
+
+// TestInsertMetadata verifies that inserting the same metadata twice results in exactly one
+// row in otel_metrics_metadata FINAL — validating the idempotency guarantee of the
+// ReplacingMergeTree engine with a deterministic MetricHash.
+func TestInsertMetadata(t *testing.T) {
+	store, cleanup := setupClickHouse(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	if err := store.CreateTables(ctx); err != nil {
+		t.Fatalf("creating tables: %v", err)
+	}
+
+	now := uint64(time.Now().UnixNano())
+	resourceMetrics := []*metricspb.ResourceMetrics{
+		{
+			Resource: &resourcepb.Resource{
+				Attributes: []*commonpb.KeyValue{
+					{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "idempotency-service"}}},
+				},
+			},
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope: &commonpb.InstrumentationScope{Name: "idempotency-scope"},
+					Metrics: []*metricspb.Metric{
+						{
+							Name: "idempotency.gauge",
+							Data: &metricspb.Metric_Gauge{
+								Gauge: &metricspb.Gauge{
+									DataPoints: []*metricspb.NumberDataPoint{
+										{
+											TimeUnixNano: now,
+											Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: 1.0},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	// Insert the same metric twice — same hash, same metadata.
+	rows, metadata := MapGaugeRows(resourceMetrics)
+	if err := store.InsertGauge(ctx, rows, metadata); err != nil {
+		t.Fatalf("first InsertGauge: %v", err)
+	}
+	if err := store.InsertGauge(ctx, rows, metadata); err != nil {
+		t.Fatalf("second InsertGauge: %v", err)
+	}
+
+	// FINAL forces merge: duplicate (TimeUnix, MetricName, MetricHash) rows are collapsed.
+	var count uint64
+	err := store.conn.QueryRow(ctx,
+		"SELECT count() FROM otel_metrics_metadata FINAL WHERE MetricName = 'idempotency.gauge'",
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected exactly 1 metadata row after two identical inserts, got %d", count)
 	}
 }
 
@@ -334,22 +431,31 @@ func TestGRPCToClickHouse(t *testing.T) {
 		t.Fatalf("exporting metrics via grpc: %v", err)
 	}
 
-	// Verify the metric landed in ClickHouse.
+	// Verify the datapoint landed in otel_metrics_gauge.
 	var (
-		svcName    string
-		metricName string
+		metricHash uint64
 		value      float64
 	)
 	err = store.conn.QueryRow(ctx,
-		"SELECT ServiceName, MetricName, Value FROM otel_metrics_gauge WHERE MetricName = 'e2e.gauge'",
-	).Scan(&svcName, &metricName, &value)
+		"SELECT MetricHash, Value FROM otel_metrics_gauge WHERE Value = 99.9",
+	).Scan(&metricHash, &value)
 	if err != nil {
-		t.Fatalf("querying clickhouse: %v", err)
-	}
-	if svcName != "e2e-service" {
-		t.Errorf("expected ServiceName=e2e-service, got %s", svcName)
+		t.Fatalf("querying otel_metrics_gauge: %v", err)
 	}
 	if value != 99.9 {
 		t.Errorf("expected Value=99.9, got %f", value)
+	}
+
+	// Verify the metadata is resolvable via the MetricHash.
+	var metaSvcName string
+	err = store.conn.QueryRow(ctx,
+		"SELECT ServiceName FROM otel_metrics_metadata FINAL WHERE MetricHash = $1",
+		metricHash,
+	).Scan(&metaSvcName)
+	if err != nil {
+		t.Fatalf("querying otel_metrics_metadata: %v", err)
+	}
+	if metaSvcName != "e2e-service" {
+		t.Errorf("expected ServiceName=e2e-service, got %s", metaSvcName)
 	}
 }

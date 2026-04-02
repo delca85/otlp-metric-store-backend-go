@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 )
 
@@ -19,19 +21,31 @@ func newServer(addr string, store MetricsStore) colmetricspb.MetricsServiceServe
 }
 
 func (m *dash0MetricsServiceServer) Export(ctx context.Context, request *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
+	ctx, span := tracer.Start(ctx, "Export")
+	defer span.End()
+
 	slog.DebugContext(ctx, "Received ExportMetricsServiceRequest")
 	metricsReceivedCounter.Add(ctx, 1)
 
 	if m.store != nil {
 		rm := request.GetResourceMetrics()
 
-		if gaugeRows := MapGaugeRows(rm); len(gaugeRows) > 0 {
-			if err := m.store.InsertGauge(ctx, gaugeRows); err != nil {
+		gaugeRows, gaugeMetadata := MapGaugeRows(rm)
+		span.SetAttributes(attribute.Int("metric.gauge.count", len(gaugeRows)))
+		if len(gaugeRows) > 0 {
+			if err := m.store.InsertGauge(ctx, gaugeRows, gaugeMetadata); err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return nil, err
 			}
 		}
-		if sumRows := MapSumRows(rm); len(sumRows) > 0 {
-			if err := m.store.InsertSum(ctx, sumRows); err != nil {
+
+		sumRows, sumMetadata := MapSumRows(rm)
+		span.SetAttributes(attribute.Int("metric.sum.count", len(sumRows)))
+		if len(sumRows) > 0 {
+			if err := m.store.InsertSum(ctx, sumRows, sumMetadata); err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, err.Error())
 				return nil, err
 			}
 		}

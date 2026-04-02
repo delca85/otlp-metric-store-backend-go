@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -20,17 +22,27 @@ import (
 var (
 	listenAddr            = flag.String("listenAddr", "localhost:4317", "The listen address")
 	maxReceiveMessageSize = flag.Int("maxReceiveMessageSize", 16777216, "The max message size in bytes the server can receive")
+
+	// ClickHouse connection flags. Separate flags are preferred over a single DSN string
+	// so that each value can be injected independently from a secrets manager.
+	clickhouseAddr     = flag.String("clickhouse-addr", "localhost:9000", "ClickHouse address (host:port)")
+	clickhouseDB       = flag.String("clickhouse-db", "default", "ClickHouse database")
+	clickhouseUser     = flag.String("clickhouse-user", "default", "ClickHouse username")
+	clickhousePassword = flag.String("clickhouse-password", "", "ClickHouse password")
 )
 
 const name = "dash0.com/otlp-log-processor-backend"
 
 var (
 	meter                  = otel.Meter(name)
+	tracer                 trace.Tracer
 	logger                 = otelslog.NewLogger(name)
 	metricsReceivedCounter metric.Int64Counter
 )
 
 func init() {
+	tracer = otel.Tracer(name)
+
 	var err error
 	metricsReceivedCounter, err = meter.Int64Counter("com.dash0.homeexercise.metrics.received",
 		metric.WithDescription("The number of metrics received by otlp-metrics-processor-backend"),
@@ -50,18 +62,30 @@ func run() (err error) {
 	slog.SetDefault(logger)
 	logger.Info("Starting application")
 
+	ctx := context.Background()
+
 	// Set up OpenTelemetry.
-	otelShutdown, err := setupOTelSDK(context.Background())
+	otelShutdown, err := setupOTelSDK(ctx)
 	if err != nil {
 		return
 	}
-
-	// Handle shutdown properly so nothing leaks.
 	defer func() {
-		err = errors.Join(err, otelShutdown(context.Background()))
+		err = errors.Join(err, otelShutdown(ctx))
 	}()
 
 	flag.Parse()
+
+	store, err := NewClickHouseMetricsStore(ctx, *clickhouseAddr, *clickhouseDB, *clickhouseUser, *clickhousePassword)
+	if err != nil {
+		return fmt.Errorf("connecting to clickhouse at %s: %w", *clickhouseAddr, err)
+	}
+	defer func() {
+		err = errors.Join(err, store.Close())
+	}()
+
+	if err = store.CreateTables(ctx); err != nil {
+		return fmt.Errorf("creating tables: %w", err)
+	}
 
 	slog.Debug("Starting listener", slog.String("listenAddr", *listenAddr))
 	listener, err := net.Listen("tcp", *listenAddr)
@@ -74,7 +98,7 @@ func run() (err error) {
 		grpc.MaxRecvMsgSize(*maxReceiveMessageSize),
 		grpc.Creds(insecure.NewCredentials()),
 	)
-	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer(*listenAddr, nil))
+	colmetricspb.RegisterMetricsServiceServer(grpcServer, newServer(*listenAddr, store))
 
 	slog.Debug("Starting gRPC server")
 
