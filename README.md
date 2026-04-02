@@ -58,6 +58,8 @@ Fields are separated by `\x00`, map entries by `\x01`, and key-value pairs by `\
 
 > Insert logic is implemented for **Gauge** and **Sum**. The remaining table schemas are defined and ready to be wired up.
 
+All tables carry a `TTL` expression configured via `-data-retention-days` (default 90 days). Data older than the retention window is dropped automatically by ClickHouse without manual intervention.
+
 ### Design decisions
 
 **Normalized schema (metadata + slim datapoint tables)**
@@ -113,10 +115,23 @@ go run ./...
 |---|---|---|
 | `-listenAddr` | `localhost:4317` | gRPC listen address |
 | `-maxReceiveMessageSize` | `16777216` (16 MB) | Max gRPC message size in bytes |
+| `-shutdown-timeout` | `30s` | Max time to drain in-flight RPCs on shutdown |
+| `-tls-cert-file` | *(empty)* | Path to TLS certificate (PEM). Required for TLS. |
+| `-tls-key-file` | *(empty)* | Path to TLS private key (PEM). Required for TLS. |
 | `-clickhouse-addr` | `localhost:9000` | ClickHouse TCP address |
 | `-clickhouse-db` | `default` | ClickHouse database name |
 | `-clickhouse-user` | `default` | ClickHouse username |
 | `-clickhouse-password` | *(empty)* | ClickHouse password |
+| `-clickhouse-max-open-conns` | `10` | Max open ClickHouse connections |
+| `-clickhouse-max-idle-conns` | `5` | Max idle ClickHouse connections |
+| `-clickhouse-conn-max-lifetime` | `1h` | Max lifetime of a ClickHouse connection |
+| `-clickhouse-max-retries` | `3` | Max retry attempts on transient insert errors |
+| `-data-retention-days` | `90` | TTL in days for all datapoint and metadata tables |
+| `-log-level` | `INFO` | Minimum log level (`DEBUG`, `INFO`, `WARN`, `ERROR`) |
+
+> **TLS:** when both `-tls-cert-file` and `-tls-key-file` are set the server uses TLS; otherwise it starts with insecure transport and logs a warning. In production, always provide a certificate.
+>
+> **Secrets:** `-clickhouse-password` is visible in `ps aux`. Prefer injecting it via a secrets manager or a wrapper that sets the flag value from an environment variable or file.
 
 **Example:**
 
@@ -158,6 +173,17 @@ go run ./... \
 ```
 
 The server creates all tables on startup and is ready to accept OTLP exports on `localhost:4317`.
+
+> **Seeing logs locally:** the server writes structured JSON logs to **stderr** directly, so log lines are always visible in the terminal. However, without an OTLP collector the exporter will log connection errors continuously. Suppress them with `OTEL_SDK_DISABLED=true`:
+>
+> ```shell
+> OTEL_SDK_DISABLED=true go run ./... \
+>   -clickhouse-addr localhost:9000 \
+>   -clickhouse-password test \
+>   -log-level DEBUG
+> ```
+>
+> This disables the OTLP export pipeline while leaving the stderr JSON logs fully intact.
 
 ### 3. Send a test metric
 
@@ -260,13 +286,25 @@ ORDER BY g.TimeUnix;
 
 ## Observability
 
-The service instruments itself using the OpenTelemetry Go SDK and exports to **stdout** by default.
+The service instruments itself using the OpenTelemetry Go SDK and exports signals via **OTLP gRPC**. Configure the collector endpoint with the standard environment variables:
+
+```shell
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317   # all signals
+# or signal-specific overrides:
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://...
+export OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://...
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://...
+```
+
+When `OTEL_EXPORTER_OTLP_ENDPOINT` is not set the exporters attempt `localhost:4317` by default; failed connections are retried silently and do not affect ingestion.
 
 | Signal | What is recorded |
 |---|---|
 | **Traces** | One span per `Export()` call; child spans per batch insert — includes table name, batch size, error status |
-| **Metrics** | `otlp.metrics.received` (counter — increments once per `Export()` RPC call, not per datapoint), `metric_store.inserts_total` (counter, `{table, status}` labels), `metric_store.insert_duration_ms` (histogram) |
+| **Metrics** | `otlp.metrics.received` (counter — datapoints received, not RPC calls), `metric_store.inserts_total` (counter, `{table, status}` labels), `metric_store.insert_duration_ms` (histogram) |
 | **Logs** | Structured logs via `log/slog` |
+
+A standard gRPC health check service (`grpc_health_v1`) is registered and can be used for Kubernetes liveness/readiness probes and load-balancer health checks.
 
 ---
 
@@ -308,21 +346,13 @@ To add support for a missing type, implement the corresponding mapping in [metri
 
 ## Future Improvements
 
-### TLS support for gRPC transport
-
-The gRPC server currently uses `insecure.NewCredentials()`. For production, it should accept `-tls-cert` / `-tls-key` flags and load `credentials.NewTLS(...)`. The insecure mode should only apply when an explicit `--insecure` flag is passed.
-
 ### Password and secrets via environment variables or files
 
-The `-clickhouse-password` CLI flag is visible in `ps aux` to co-tenant processes. A production deployment should prefer `CLICKHOUSE_PASSWORD` environment variable or a `-clickhouse-password-file` flag that reads from a file (compatible with Kubernetes secret volume mounts).
+The `-clickhouse-password` CLI flag is visible in `ps aux` to co-tenant processes. A production deployment should prefer injecting the value via a secrets manager or a `-clickhouse-password-file` flag that reads from a file (compatible with Kubernetes secret volume mounts).
 
 ### Application-level write buffer
 
 For sustained very-high-throughput scenarios, an in-process ring buffer (channel + flush goroutine) that accumulates rows across multiple gRPC calls and flushes in large batches on a timer or size threshold would reduce ClickHouse write amplification further. The current `async_insert=1` delegation is simpler and sufficient at moderate rates.
-
-### gRPC health check endpoint
-
-Register `grpc_health_v1` so Kubernetes liveness and readiness probes have a standard target. This also enables load-balancer health checks in service meshes.
 
 ### Secondary skip indexes for `otel_metrics_metadata`
 
