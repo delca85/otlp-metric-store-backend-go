@@ -30,12 +30,12 @@ OTLP sender (e.g. OTel Collector)
     ▼             ▼
 otel_metrics_      otel_metrics_gauge
 metadata           otel_metrics_sum
-(ReplacingMerge)   otel_metrics_histogram …
+(AggregatingMerge) otel_metrics_histogram …
 ```
 
 ### Schema design
 
-Metric identity (name, service, attributes) is extracted once into `otel_metrics_metadata` (`ReplacingMergeTree`), which deduplicates rows automatically on merge. Datapoint tables (`MergeTree`) store only the numeric value, timestamps, and a `MetricHash` — a deterministic `UInt64` xxHash64 of the identity fields computed in Go at ingest time.
+Metric identity (name, service, attributes) is extracted once into `otel_metrics_metadata` (`AggregatingMergeTree`), which merges duplicate rows per sort key on compaction, applying `anyLast` semantics to mutable fields. Datapoint tables (`MergeTree`) store only the numeric value, timestamps, and a `MetricHash` — a deterministic `UInt64` xxHash64 of the identity fields computed in Go at ingest time.
 
 This eliminates per-datapoint attribute storage while keeping JOINs fast: metadata cardinality is expected to be low and the table fits in memory for broadcast joins.
 
@@ -45,7 +45,7 @@ This eliminates per-datapoint attribute storage while keeping JOINs fast: metada
 
 | Table | Engine | Partition | Purpose |
 |---|---|---|---|
-| `otel_metrics_metadata` | ReplacingMergeTree | monthly (`toYYYYMM(TimeUnix)`) | Metric identity + attributes lookup |
+| `otel_metrics_metadata` | AggregatingMergeTree | monthly (`toYYYYMM(TimeUnix)`) | Metric identity + attributes lookup |
 | `otel_metrics_gauge` | MergeTree | daily (`toDate(TimeUnix)`) | Gauge datapoints |
 | `otel_metrics_sum` | MergeTree | daily | Sum datapoints |
 | `otel_metrics_histogram` | MergeTree | daily | Histogram datapoints (schema only) |
@@ -53,6 +53,23 @@ This eliminates per-datapoint attribute storage while keeping JOINs fast: metada
 | `otel_metrics_summary` | MergeTree | daily | Summary datapoints (schema only) |
 
 > Insert logic is implemented for **Gauge** and **Sum**. The remaining table schemas are defined and ready to be wired up.
+
+### Design decisions
+
+**Normalized schema (metadata + slim datapoint tables)**
+Storing metric identity (name, service, attributes) once in a shared lookup table avoids repeating the same strings on every datapoint row. At the expected cardinality, the metadata table fits entirely in memory, making JOIN lookups effectively free.
+
+**Deterministic hash as join key (xxHash64)**
+ClickHouse has no transactions and no `RETURNING` clause, so a DB-generated ID would require a `SELECT` per insert to check existence — a bottleneck at high throughput. A hash computed in Go from the sorted identity fields is deterministic across runs: the same metric series always produces the same `MetricHash`, making metadata inserts idempotent with no DB round-trip.
+
+**`AggregatingMergeTree` over `ReplacingMergeTree` for metadata**
+Both engines deduplicate rows on compaction. `ReplacingMergeTree` keeps the latest *full row*, which loses independent tracking of mutable fields: if `MetricDescription` or `MetricUnit` changes while the metric identity stays the same, RMT can only overwrite the whole row. `AggregatingMergeTree` with `SimpleAggregateFunction(anyLast, T)` per mutable column merges each field independently, so changes to one field don't silently overwrite others.
+
+**Partition + ordering strategy eliminates full scans**
+All queries are guaranteed to include a time-frame filter. Partitioning by time (monthly for metadata, daily for datapoints) combined with a time-leading `ORDER BY` key ensures ClickHouse prunes irrelevant parts before scanning a single row.
+
+**Server-side async inserts for high throughput**
+`async_insert=1` with `wait_for_async_insert=1` lets ClickHouse buffer and merge small per-RPC inserts server-side without application-level batching logic, while still propagating errors back to the caller.
 
 ---
 
@@ -93,7 +110,7 @@ go run ./...
 | `-clickhouse-addr` | `localhost:9000` | ClickHouse TCP address |
 | `-clickhouse-db` | `default` | ClickHouse database name |
 | `-clickhouse-user` | `default` | ClickHouse username |
-| `-clickhouse-password` | _(empty)_ | ClickHouse password |
+| `-clickhouse-password` | *(empty)* | ClickHouse password |
 
 **Example:**
 
@@ -217,4 +234,4 @@ INDEX idx_attr_value       mapValues(Attributes)         TYPE bloom_filter(0.01)
 
 - [OpenTelemetry Metrics concepts](https://opentelemetry.io/docs/concepts/signals/metrics/)
 - [OpenTelemetry Protocol (OTLP)](https://github.com/open-telemetry/opentelemetry-proto)
-- [ClickHouse ReplacingMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/replacingmergetree)
+- [ClickHouse AggregatingMergeTree](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/aggregatingmergetree)

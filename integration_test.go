@@ -298,7 +298,7 @@ func TestInsertSum(t *testing.T) {
 
 // TestInsertMetadata verifies that inserting the same metadata twice results in exactly one
 // row in otel_metrics_metadata FINAL — validating the idempotency guarantee of the
-// ReplacingMergeTree engine with a deterministic MetricHash.
+// AggregatingMergeTree engine with a deterministic MetricHash.
 func TestInsertMetadata(t *testing.T) {
 	store, cleanup := setupClickHouse(t)
 	defer cleanup()

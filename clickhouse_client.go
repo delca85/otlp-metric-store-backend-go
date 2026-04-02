@@ -15,8 +15,9 @@ import (
 
 // MetadataRow represents a metric series metadata entry for otel_metrics_metadata.
 // One row per unique (MetricName, ServiceName, ResourceAttributes, ScopeAttributes, Attributes)
-// combination per day. The ReplacingMergeTree engine keeps the latest row per
-// (TimeUnix, MetricName, MetricHash) key on merge.
+// combination per day. The AggregatingMergeTree engine merges duplicate rows per
+// (TimeUnix, MetricName, MetricHash) key: mutable fields use SimpleAggregateFunction(anyLast)
+// to keep the most recent value per column independently.
 type MetadataRow struct {
 	TimeUnix           time.Time         // Date of the datapoint (toDate granularity); first ORDER BY key
 	MetricHash         uint64            // xxHash64 of identity fields; join key to datapoint tables
@@ -135,8 +136,9 @@ func (s *ClickHouseMetricsStore) CreateTables(ctx context.Context) error {
 }
 
 // insertMetadata batch-inserts metadata rows into otel_metrics_metadata.
-// Inserting the same MetricHash row multiple times is idempotent: the ReplacingMergeTree
-// engine keeps the latest row per (TimeUnix, MetricName, MetricHash) at compaction time.
+// Inserting the same MetricHash row multiple times is idempotent: the AggregatingMergeTree
+// engine merges duplicate rows per (TimeUnix, MetricName, MetricHash) at compaction time,
+// applying SimpleAggregateFunction semantics (anyLast) per mutable column.
 // Within-batch duplicates are already collapsed by the mapper before this is called.
 func (s *ClickHouseMetricsStore) insertMetadata(ctx context.Context, metadata []MetadataRow) error {
 	batch, err := s.conn.PrepareBatch(ctx, "INSERT INTO otel_metrics_metadata")

@@ -1,23 +1,28 @@
 package main
 
 // createMetadataTableSQL defines the shared metadata lookup table.
-// Engine: ReplacingMergeTree — on merge, keeps the latest row per (TimeUnix, MetricName, MetricHash).
+// Engine: AggregatingMergeTree — on merge, aggregates columns per (TimeUnix, MetricName, MetricHash).
+// Mutable fields (description, unit, type, attributes) use SimpleAggregateFunction(anyLast, T) to
+// keep the most recent value independently per column on merge. Immutable identity fields
+// (MetricName, ServiceName) that are constant for a given MetricHash use plain types.
+// Note: Map key type falls back to plain String inside SimpleAggregateFunction — LowCardinality
+// is not supported as a Map key type within SAF wrappers.
 // Queries against this table should use FINAL to force merge completion before reading.
 const createMetadataTableSQL = `
 CREATE TABLE IF NOT EXISTS otel_metrics_metadata (
     TimeUnix            Date CODEC(Delta, LZ4),
     MetricHash          UInt64,
     MetricName          LowCardinality(String),
-    MetricDescription   String,
-    MetricUnit          String,
-    MetricType          Enum8('Gauge'=1,'Sum'=2,'Histogram'=3,'ExpHistogram'=4,'Summary'=5),
+    MetricDescription   SimpleAggregateFunction(anyLast, String),
+    MetricUnit          SimpleAggregateFunction(anyLast, String),
+    MetricType          SimpleAggregateFunction(anyLast, Enum8('Gauge'=1,'Sum'=2,'Histogram'=3,'ExpHistogram'=4,'Summary'=5)),
     ServiceName         LowCardinality(String),
-    ResourceAttributes  Map(LowCardinality(String), String),
-    ScopeAttributes     Map(LowCardinality(String), String),
-    Attributes          Map(LowCardinality(String), String),
-    ScopeName           String,
-    ScopeVersion        String
-) ENGINE = ReplacingMergeTree()
+    ResourceAttributes  SimpleAggregateFunction(anyLast, Map(String, String)),
+    ScopeAttributes     SimpleAggregateFunction(anyLast, Map(String, String)),
+    Attributes          SimpleAggregateFunction(anyLast, Map(String, String)),
+    ScopeName           SimpleAggregateFunction(anyLast, String),
+    ScopeVersion        SimpleAggregateFunction(anyLast, String)
+) ENGINE = AggregatingMergeTree()
 PARTITION BY toYYYYMM(TimeUnix)
 ORDER BY (TimeUnix, MetricName, MetricHash)
 SETTINGS index_granularity = 8192;
