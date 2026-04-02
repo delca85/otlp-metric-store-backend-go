@@ -99,6 +99,14 @@ go build ./...
 make build
 ```
 
+Inject the service version at build time so it appears in traces, metrics, and logs:
+
+```shell
+go build -ldflags="-X main.version=$(git describe --tags --always)" ./...
+```
+
+Falls back to `"dev"` when the flag is not provided.
+
 ---
 
 ## Run
@@ -297,6 +305,10 @@ export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://...
 ```
 
 When `OTEL_EXPORTER_OTLP_ENDPOINT` is not set the exporters attempt `localhost:4317` by default; failed connections are retried silently and do not affect ingestion.
+
+**TLS:** the OTLP gRPC exporters use TLS with system CA certificates by default. Set `OTEL_EXPORTER_OTLP_INSECURE=true` to disable TLS — useful when the collector runs as a localhost process or sidecar container.
+
+**Sampling:** traces use a parent-based sampler so downstream spans inherit the caller's sampling decision. The root ratio defaults to 1.0 (sample everything). Set `OTEL_TRACES_SAMPLER_ARG=0.1` to sample 10% of root spans in high-traffic deployments.
 
 | Signal | What is recorded |
 |---|---|
